@@ -1908,7 +1908,10 @@ class LiveTradingAdapter:
         posi_direction = data['PosiDirection']
         position = data.get('Position', 0)
         today_pos = data.get('TodayPosition', 0)
-        yd_pos = data.get('YdPosition', 0)
+        # 【关键修复】上海期货交易所(SHFE)和能源交易中心(INE)的YdPosition字段不可靠
+        # 正确的昨仓计算方式：昨仓 = 总持仓 - 今仓
+        # 这样无论哪个交易所都能正确计算昨仓
+        yd_pos = position - today_pos  # 不再使用 data.get('YdPosition', 0)
         
         # 更新持仓到适配器级别的字典（按symbol+direction作为键）
         if not hasattr(self, '_position_cache'):

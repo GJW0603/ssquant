@@ -394,12 +394,17 @@ class RealTradingTraderSpi(TraderSpi):
                     'long_yd': 0, 'short_yd': 0, 'long_today': 0, 'short_today': 0
                 }
             
+            # 【关键修复】上海期货交易所(SHFE)和能源交易中心(INE)的YdPosition字段不可靠
+            # 正确的昨仓计算方式：昨仓 = 总持仓 - 今仓
+            # 这样无论哪个交易所都能正确计算昨仓
+            calculated_yd_pos = position - today_pos
+            
             if data['PosiDirection'] == '2':  # 多头
                 self.client._position_cache[instrument_id]['long_today'] = today_pos
-                self.client._position_cache[instrument_id]['long_yd'] = yd_pos
+                self.client._position_cache[instrument_id]['long_yd'] = calculated_yd_pos
             elif data['PosiDirection'] == '3':  # 空头
                 self.client._position_cache[instrument_id]['short_today'] = today_pos
-                self.client._position_cache[instrument_id]['short_yd'] = yd_pos
+                self.client._position_cache[instrument_id]['short_yd'] = calculated_yd_pos
             
             self.client.on_position(data)
         
