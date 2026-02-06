@@ -796,6 +796,7 @@ class LiveDataSource:
         """卖出平仓（平多头）
         
         支持智能分单：当今仓+昨仓混合时，自动拆分为两个订单
+        支持旧合约换月：如果持仓来自旧合约，自动使用旧合约代码平仓
         
         Args:
             volume: 交易量，如果不提供则平所有多头持仓
@@ -809,6 +810,13 @@ class LiveDataSource:
             if log_callback:
                 log_callback("[错误] CTP客户端未初始化")
             return
+        
+        # 【关键】检查是否有旧合约持仓需要平仓
+        # _old_contract 由持仓同步时设置，表示该数据源的持仓实际来自旧合约
+        trade_symbol = getattr(self, '_old_contract', None) or self.symbol
+        is_old_contract = (trade_symbol != self.symbol)
+        if is_old_contract and log_callback:
+            log_callback(f"[换月平仓] 使用旧合约 {trade_symbol} 进行平仓（数据源: {self.symbol}）")
         
         # 获取多头今仓和昨仓（支持锁仓情况）
         long_today = getattr(self, 'long_today', 0)
@@ -845,6 +853,15 @@ class LiveDataSource:
             # 使用传入的offset_ticks，如果没有则使用配置中的值
             actual_offset = offset_ticks if offset_ticks is not None else self.order_offset_ticks
             
+            # 【关键修复】旧合约换月平仓时，使用更大的偏移量确保成交
+            # 因为旧合约没有订阅行情，使用的是新合约价格，可能与旧合约价格有差异
+            # 使用100跳偏移量，确保能够成交（换月的目标是尽快平掉旧合约）
+            if is_old_contract:
+                OLD_CONTRACT_OFFSET_TICKS = 100  # 旧合约平仓使用100跳偏移
+                actual_offset = max(actual_offset, OLD_CONTRACT_OFFSET_TICKS)
+                if log_callback:
+                    log_callback(f"[换月平仓] 旧合约 {trade_symbol} 无行情数据，使用大偏移量 {actual_offset} 跳确保成交")
+            
             # 计算委托价格（使用CTP原始字段名）
             tick = self.ticks[-1] if self.ticks else None
             if tick and 'BidPrice1' in tick and tick['BidPrice1'] > 0:
@@ -856,12 +873,12 @@ class LiveDataSource:
         if long_today >= volume:
             # 今仓足够，只平今仓
             if log_callback:
-                log_callback(f"[平多判断] {self.symbol} 多头今仓={long_today}, 多头昨仓={long_yd} → 平今仓{volume}手")
+                log_callback(f"[平多判断] {trade_symbol} 多头今仓={long_today}, 多头昨仓={long_yd} → 平今仓{volume}手")
                 from datetime import datetime
                 time_str = datetime.now().strftime("%H:%M:%S")
                 offset_msg = f"(偏移{actual_offset}跳)" if actual_offset != 0 else "(限价)"
-                log_callback(f"📤 [{time_str}] [卖平] {self.symbol} 委托价={limit_price:.2f} {offset_msg} 数量={volume} (今仓) 原因={reason}")
-            self.ctp_client.sell_close(self.symbol, limit_price, volume, close_today=True)
+                log_callback(f"📤 [{time_str}] [卖平] {trade_symbol} 委托价={limit_price:.2f} {offset_msg} 数量={volume} (今仓) 原因={reason}")
+            self.ctp_client.sell_close(trade_symbol, limit_price, volume, close_today=True)
             
         elif long_today > 0:
             # 今仓不足，需要分单：先平今仓，再平昨仓
@@ -869,14 +886,14 @@ class LiveDataSource:
             close_yd_volume = volume - long_today
             
             if log_callback:
-                log_callback(f"[平多判断] {self.symbol} 多头今仓={long_today}, 多头昨仓={long_yd} → 需分单: 平今{close_today_volume}手 + 平昨{close_yd_volume}手")
+                log_callback(f"[平多判断] {trade_symbol} 多头今仓={long_today}, 多头昨仓={long_yd} → 需分单: 平今{close_today_volume}手 + 平昨{close_yd_volume}手")
                 from datetime import datetime
                 time_str = datetime.now().strftime("%H:%M:%S")
                 offset_msg = f"(偏移{actual_offset}跳)" if actual_offset != 0 else "(限价)"
-                log_callback(f"📤 [{time_str}] [卖平] {self.symbol} 委托价={limit_price:.2f} {offset_msg} 数量={close_today_volume} (今仓) 原因={reason}")
+                log_callback(f"📤 [{time_str}] [卖平] {trade_symbol} 委托价={limit_price:.2f} {offset_msg} 数量={close_today_volume} (今仓) 原因={reason}")
             
             # 先平今仓
-            self.ctp_client.sell_close(self.symbol, limit_price, close_today_volume, close_today=True)
+            self.ctp_client.sell_close(trade_symbol, limit_price, close_today_volume, close_today=True)
             
             # 再平昨仓（已在前面检查过总仓位，这里昨仓一定足够）
             if close_yd_volume > 0:
@@ -884,17 +901,17 @@ class LiveDataSource:
                     from datetime import datetime
                     time_str = datetime.now().strftime("%H:%M:%S")
                     offset_msg = f"(偏移{actual_offset}跳)" if actual_offset != 0 else "(限价)"
-                    log_callback(f"📤 [{time_str}] [卖平] {self.symbol} 委托价={limit_price:.2f} {offset_msg} 数量={close_yd_volume} (昨仓) 原因={reason}")
-                self.ctp_client.sell_close(self.symbol, limit_price, close_yd_volume, close_today=False)
+                    log_callback(f"📤 [{time_str}] [卖平] {trade_symbol} 委托价={limit_price:.2f} {offset_msg} 数量={close_yd_volume} (昨仓) 原因={reason}")
+                self.ctp_client.sell_close(trade_symbol, limit_price, close_yd_volume, close_today=False)
         else:
             # 没有今仓，只平昨仓
             if log_callback:
-                log_callback(f"[平多判断] {self.symbol} 多头今仓={long_today}, 多头昨仓={long_yd} → 平昨仓{volume}手")
+                log_callback(f"[平多判断] {trade_symbol} 多头今仓={long_today}, 多头昨仓={long_yd} → 平昨仓{volume}手")
                 from datetime import datetime
                 time_str = datetime.now().strftime("%H:%M:%S")
                 offset_msg = f"(偏移{actual_offset}跳)" if actual_offset != 0 else "(限价)"
-                log_callback(f"📤 [{time_str}] [卖平] {self.symbol} 委托价={limit_price:.2f} {offset_msg} 数量={volume} (昨仓) 原因={reason}")
-            self.ctp_client.sell_close(self.symbol, limit_price, volume, close_today=False)
+                log_callback(f"📤 [{time_str}] [卖平] {trade_symbol} 委托价={limit_price:.2f} {offset_msg} 数量={volume} (昨仓) 原因={reason}")
+            self.ctp_client.sell_close(trade_symbol, limit_price, volume, close_today=False)
     
     def sellshort(self, volume: int = 1, reason: str = "", log_callback=None, order_type: str = 'bar_close', offset_ticks: Optional[int] = None, price: Optional[float] = None):
         """卖出开仓(做空)
@@ -943,6 +960,7 @@ class LiveDataSource:
         """买入平仓（平空头）
         
         支持智能分单：当今仓+昨仓混合时，自动拆分为两个订单
+        支持旧合约换月：如果持仓来自旧合约，自动使用旧合约代码平仓
         
         Args:
             volume: 交易量，如果不提供则平所有空头持仓
@@ -956,6 +974,12 @@ class LiveDataSource:
             if log_callback:
                 log_callback("[错误] CTP客户端未初始化")
             return
+        
+        # 【关键】检查是否有旧合约持仓需要平仓
+        trade_symbol = getattr(self, '_old_contract', None) or self.symbol
+        is_old_contract = (trade_symbol != self.symbol)
+        if is_old_contract and log_callback:
+            log_callback(f"[换月平仓] 使用旧合约 {trade_symbol} 进行平仓（数据源: {self.symbol}）")
         
         # 获取空头今仓和昨仓（支持锁仓情况）
         short_today = getattr(self, 'short_today', 0)
@@ -992,6 +1016,15 @@ class LiveDataSource:
             # 使用传入的offset_ticks，如果没有则使用配置中的值
             actual_offset = offset_ticks if offset_ticks is not None else self.order_offset_ticks
             
+            # 【关键修复】旧合约换月平仓时，使用更大的偏移量确保成交
+            # 因为旧合约没有订阅行情，使用的是新合约价格，可能与旧合约价格有差异
+            # 使用100跳偏移量，确保能够成交（换月的目标是尽快平掉旧合约）
+            if is_old_contract:
+                OLD_CONTRACT_OFFSET_TICKS = 100  # 旧合约平仓使用100跳偏移
+                actual_offset = max(actual_offset, OLD_CONTRACT_OFFSET_TICKS)
+                if log_callback:
+                    log_callback(f"[换月平仓] 旧合约 {trade_symbol} 无行情数据，使用大偏移量 {actual_offset} 跳确保成交")
+            
             # 计算委托价格（使用CTP原始字段名）
             tick = self.ticks[-1] if self.ticks else None
             if tick and 'AskPrice1' in tick and tick['AskPrice1'] > 0:
@@ -1003,12 +1036,12 @@ class LiveDataSource:
         if short_today >= volume:
             # 今仓足够，只平今仓
             if log_callback:
-                log_callback(f"[平空判断] {self.symbol} 空头今仓={short_today}, 空头昨仓={short_yd} → 平今仓{volume}手")
+                log_callback(f"[平空判断] {trade_symbol} 空头今仓={short_today}, 空头昨仓={short_yd} → 平今仓{volume}手")
                 from datetime import datetime
                 time_str = datetime.now().strftime("%H:%M:%S")
                 offset_msg = f"(偏移{actual_offset}跳)" if actual_offset != 0 else "(限价)"
-                log_callback(f"📤 [{time_str}] [买平] {self.symbol} 委托价={limit_price:.2f} {offset_msg} 数量={volume} (今仓) 原因={reason}")
-            self.ctp_client.buy_close(self.symbol, limit_price, volume, close_today=True)
+                log_callback(f"📤 [{time_str}] [买平] {trade_symbol} 委托价={limit_price:.2f} {offset_msg} 数量={volume} (今仓) 原因={reason}")
+            self.ctp_client.buy_close(trade_symbol, limit_price, volume, close_today=True)
             
         elif short_today > 0:
             # 今仓不足，需要分单：先平今仓，再平昨仓
@@ -1016,14 +1049,14 @@ class LiveDataSource:
             close_yd_volume = volume - short_today
             
             if log_callback:
-                log_callback(f"[平空判断] {self.symbol} 空头今仓={short_today}, 空头昨仓={short_yd} → 需分单: 平今{close_today_volume}手 + 平昨{close_yd_volume}手")
+                log_callback(f"[平空判断] {trade_symbol} 空头今仓={short_today}, 空头昨仓={short_yd} → 需分单: 平今{close_today_volume}手 + 平昨{close_yd_volume}手")
                 from datetime import datetime
                 time_str = datetime.now().strftime("%H:%M:%S")
                 offset_msg = f"(偏移{actual_offset}跳)" if actual_offset != 0 else "(限价)"
-                log_callback(f"📤 [{time_str}] [买平] {self.symbol} 委托价={limit_price:.2f} {offset_msg} 数量={close_today_volume} (今仓) 原因={reason}")
+                log_callback(f"📤 [{time_str}] [买平] {trade_symbol} 委托价={limit_price:.2f} {offset_msg} 数量={close_today_volume} (今仓) 原因={reason}")
             
             # 先平今仓
-            self.ctp_client.buy_close(self.symbol, limit_price, close_today_volume, close_today=True)
+            self.ctp_client.buy_close(trade_symbol, limit_price, close_today_volume, close_today=True)
             
             # 再平昨仓（已在前面检查过总仓位，这里昨仓一定足够）
             if close_yd_volume > 0:
@@ -1031,17 +1064,17 @@ class LiveDataSource:
                     from datetime import datetime
                     time_str = datetime.now().strftime("%H:%M:%S")
                     offset_msg = f"(偏移{actual_offset}跳)" if actual_offset != 0 else "(限价)"
-                    log_callback(f"📤 [{time_str}] [买平] {self.symbol} 委托价={limit_price:.2f} {offset_msg} 数量={close_yd_volume} (昨仓) 原因={reason}")
-                self.ctp_client.buy_close(self.symbol, limit_price, close_yd_volume, close_today=False)
+                    log_callback(f"📤 [{time_str}] [买平] {trade_symbol} 委托价={limit_price:.2f} {offset_msg} 数量={close_yd_volume} (昨仓) 原因={reason}")
+                self.ctp_client.buy_close(trade_symbol, limit_price, close_yd_volume, close_today=False)
         else:
             # 没有今仓，只平昨仓
             if log_callback:
-                log_callback(f"[平空判断] {self.symbol} 空头今仓={short_today}, 空头昨仓={short_yd} → 平昨仓{volume}手")
+                log_callback(f"[平空判断] {trade_symbol} 空头今仓={short_today}, 空头昨仓={short_yd} → 平昨仓{volume}手")
                 from datetime import datetime
                 time_str = datetime.now().strftime("%H:%M:%S")
                 offset_msg = f"(偏移{actual_offset}跳)" if actual_offset != 0 else "(限价)"
-                log_callback(f"📤 [{time_str}] [买平] {self.symbol} 委托价={limit_price:.2f} {offset_msg} 数量={volume} (昨仓) 原因={reason}")
-            self.ctp_client.buy_close(self.symbol, limit_price, volume, close_today=False)
+                log_callback(f"📤 [{time_str}] [买平] {trade_symbol} 委托价={limit_price:.2f} {offset_msg} 数量={volume} (昨仓) 原因={reason}")
+            self.ctp_client.buy_close(trade_symbol, limit_price, volume, close_today=False)
     
     def buytocover(self, volume: Optional[int] = None, reason: str = "", log_callback=None, order_type: str = 'bar_close', offset_ticks: Optional[int] = None, price: Optional[float] = None):
         """买入平仓(平空) - 别名
@@ -1593,8 +1626,12 @@ class LiveTradingAdapter:
               f"价格={data['Price']:.2f} 数量={data['Volume']}")
         
         # 更新持仓：找到对应的数据源
+        # 支持旧合约成交：如果数据源的 _old_contract 与成交合约匹配，也进行更新
         for ds in self.multi_data_source.data_sources:
-            if ds.symbol == symbol:
+            # 精确匹配或旧合约匹配
+            old_contract = getattr(ds, '_old_contract', None)
+            is_match = (ds.symbol == symbol) or (old_contract and old_contract.upper() == symbol.upper())
+            if is_match:
                 volume = data['Volume']
                 direction_flag = data['Direction']
                 
@@ -1695,6 +1732,15 @@ class LiveTradingAdapter:
                             ds.yd_pos -= volume
                             ds.long_yd = max(0, ds.long_yd - volume)
                         ds.long_pos = max(0, ds.long_pos - volume)
+                
+                # 【关键】平仓成交后，检查是否已平完旧合约持仓
+                # 如果已经没有持仓了，清除 _old_contract 标记
+                if offset_flag != '0':  # 平仓操作
+                    total_pos = getattr(ds, 'long_pos', 0) + getattr(ds, 'short_pos', 0)
+                    if total_pos == 0 and hasattr(ds, '_old_contract'):
+                        old_contract = ds._old_contract
+                        del ds._old_contract
+                        print(f"[换月平仓完成] {old_contract} 持仓已清空，已清除旧合约标记")
                 
                 break
         
@@ -2006,10 +2052,45 @@ class LiveTradingAdapter:
                 if long_pos > 0 or short_pos > 0:
                     print(f"  - {orig_sym}: 多头={long_pos}手, 空头={short_pos}手")
         
-        # 将持仓数据同步到所有数据源（大小写不敏感匹配）
+        # 【辅助函数】提取品种代码（去除数字后缀）
+        def extract_variety_code(symbol: str) -> str:
+            """从合约代码提取品种代码，如 SC2603 -> SC"""
+            import re
+            match = re.match(r'^([a-zA-Z]+)', symbol)
+            return match.group(1).upper() if match else symbol.upper()
+        
+        # 构建品种代码到持仓数据的映射（用于模糊匹配旧合约）
+        variety_positions = {}  # {variety_upper: {symbol_upper: pos_data}}
+        for sym_upper, pos_data in symbol_positions.items():
+            variety = extract_variety_code(sym_upper)
+            if variety not in variety_positions:
+                variety_positions[variety] = {}
+            variety_positions[variety][sym_upper] = pos_data
+        
+        # 将持仓数据同步到所有数据源
+        # 优先精确匹配，如果没匹配到则按品种代码模糊匹配（支持旧合约换月）
         for ds in self.multi_data_source.data_sources:
             symbol_upper = ds.symbol.upper()
             pos_data = symbol_positions.get(symbol_upper, {})
+            
+            # 【关键修复】如果精确匹配没有持仓，尝试按品种代码模糊匹配
+            # 这样旧合约（如SC2603）的持仓可以同步到新合约（如SC2604）的数据源
+            if not pos_data or (pos_data.get('long', 0) == 0 and pos_data.get('short', 0) == 0):
+                ds_variety = extract_variety_code(symbol_upper)
+                if ds_variety in variety_positions:
+                    # 找到该品种的所有持仓合约
+                    variety_contracts = variety_positions[ds_variety]
+                    for contract_upper, contract_pos in variety_contracts.items():
+                        # 只同步有持仓的合约（避免覆盖已有持仓）
+                        if contract_pos.get('long', 0) > 0 or contract_pos.get('short', 0) > 0:
+                            if contract_upper != symbol_upper:
+                                # 找到旧合约持仓，同步到当前数据源
+                                pos_data = contract_pos
+                                orig_sym = symbol_original.get(contract_upper, contract_upper)
+                                print(f"[持仓同步] 旧合约 {orig_sym} 的持仓已同步到数据源 {ds.symbol}")
+                                # 【重要】保存旧合约代码，平仓时需要使用
+                                ds._old_contract = orig_sym
+                            break
             
             long_pos = pos_data.get('long', 0)
             short_pos = pos_data.get('short', 0)

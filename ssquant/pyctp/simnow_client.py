@@ -413,6 +413,7 @@ class SIMNOWTraderSpi(TraderSpi):
             # 持仓状态由用户回调自行处理，框架保持安静
             
             # 更新内部持仓缓存（用于智能重试判断）
+            # 【关键修复】使用累加模式，因为CTP可能对同一品种分多次回调（今仓/昨仓分开）
             instrument_id = data['InstrumentID']
             if instrument_id not in self.client._position_cache:
                 self.client._position_cache[instrument_id] = {
@@ -424,12 +425,13 @@ class SIMNOWTraderSpi(TraderSpi):
             # 这样无论哪个交易所都能正确计算昨仓
             calculated_yd_pos = position - today_pos
             
+            # 【累加模式】同一品种可能有多条持仓记录，需要累加
             if data['PosiDirection'] == '2':  # 多头
-                self.client._position_cache[instrument_id]['long_today'] = today_pos
-                self.client._position_cache[instrument_id]['long_yd'] = calculated_yd_pos
+                self.client._position_cache[instrument_id]['long_today'] += today_pos
+                self.client._position_cache[instrument_id]['long_yd'] += calculated_yd_pos
             elif data['PosiDirection'] == '3':  # 空头
-                self.client._position_cache[instrument_id]['short_today'] = today_pos
-                self.client._position_cache[instrument_id]['short_yd'] = calculated_yd_pos
+                self.client._position_cache[instrument_id]['short_today'] += today_pos
+                self.client._position_cache[instrument_id]['short_yd'] += calculated_yd_pos
             
             self.client.on_position(data)
         
@@ -769,6 +771,16 @@ class SIMNOWClient:
     
     def query_position(self, instrument_id: str = ""):
         """查询持仓"""
+        # 查询前清空缓存（因为回调使用累加模式）
+        if instrument_id:
+            # 查询特定品种，只清空该品种的缓存
+            if instrument_id in self._position_cache:
+                self._position_cache[instrument_id] = {
+                    'long_yd': 0, 'short_yd': 0, 'long_today': 0, 'short_today': 0
+                }
+        else:
+            # 查询全部，清空所有缓存
+            self._position_cache.clear()
         self.trader_api.qry_investor_position(self.broker_id, self.investor_id, instrument_id)
     
     def query_orders(self, instrument_id: str = ""):
