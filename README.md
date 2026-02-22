@@ -119,30 +119,7 @@ config = get_config(
 
 ## ⚡ 快速开始
 
-### 1. 安装
-
-**方式一：从 PyPI 安装**
-
-```bash
-pip install ssquant
-```
-
-**方式二：从 GitHub/Gitee 源码安装（推荐）**
-
-如果您下载了源码压缩包（通常解压后文件夹名为 `ssquant-main`），或者通过 git clone 拉取了代码：
-
-1. 打开终端（CMD/PowerShell/Bash），进入该文件夹（确保能看到 `setup.py` 文件）。
-2. 运行安装命令：
-
-```bash
-pip install -e .
-```
-
-> **注意**：
-> - 命令最后有一个点 `.`，代表当前目录，不要漏掉。
-> - 文件夹名字（如 `ssquant-main`）不影响安装，只要目录结构正确即可。
-
-#### 🔄 更新到最新版本
+### 1. 安装及更新
 
 **方式一：Git 更新（推荐）**
 
