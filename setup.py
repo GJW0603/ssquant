@@ -27,7 +27,7 @@ else:
 
 setup(
     name='ssquant',
-    version='0.4.1',
+    version='0.4.2',
     author='SSQuant Team',
     author_email='339093103@qq.com',
     description='专业的期货CTP量化交易框架',
@@ -44,6 +44,7 @@ setup(
         'ssquant.ctp': [
             'py*/*.pyd',
             'py*/*.dll',
+            'py*/*.so',
             'py*/*.py',
             'py*/*.lib',
             '*.h',
@@ -88,6 +89,7 @@ setup(
         'Programming Language :: Python :: 3.13',
         'Programming Language :: Python :: 3.14',
         'Operating System :: Microsoft :: Windows',
+        'Operating System :: POSIX :: Linux',
     ],
     
     # 关键词

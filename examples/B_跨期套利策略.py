@@ -242,6 +242,11 @@ if __name__ == "__main__":
             account='simnow_default',         # 账户名称
             server_name='电信1',              # 服务器: 电信1/电信2/移动/TEST(盘后测试)
             
+            # -------- K线数据源（可选）--------
+            # 默认 'local': 本地 CTP Tick 实时聚合K线
+            # 切换 'data_server': K线由 data_server WebSocket 推送（需 data_server 运行中）
+            #kline_source='data_server', #取消注释即可使用data_server推送的K线
+            
             # -------- 跨期套利配置 --------
             # ⭐ 关键：使用 history_symbol 指定历史数据来源
             # 近月用主力数据(rb888)，远月用次主力数据(rb777)
@@ -299,6 +304,11 @@ if __name__ == "__main__":
         config = get_config(RUN_MODE,
             # -------- 账户配置 --------
             account='real_default',           # 账户名称 (对应trading_config.py中的配置)
+            
+            # -------- K线数据源（可选）--------
+            # 默认 'local': 本地 CTP Tick 实时聚合K线
+            # 切换 'data_server': K线由 data_server WebSocket 推送（需 data_server 运行中）
+            #kline_source='data_server', #取消注释即可使用data_server推送的K线
             
             # -------- 跨期套利配置 --------
             # ⭐ 关键：使用 history_symbol 指定历史数据来源

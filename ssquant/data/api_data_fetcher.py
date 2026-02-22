@@ -323,6 +323,46 @@ class TradingCalendar:
         # 返回第一个和最后一个交易日
         return trading_days[0].strftime('%Y-%m-%d'), trading_days[-1].strftime('%Y-%m-%d')
     
+    def get_next_trading_day(self, date_input) -> str:
+        """
+        获取指定日期之后的下一个交易日
+        
+        用于日线聚合：夜盘K线归属到下一个交易日
+        例如：
+        - 周五夜盘 → 下一个交易日是周一
+        - 节假日前夜盘 → 下一个交易日是节后第一天
+        
+        Args:
+            date_input: 日期，可以是字符串(YYYYMMDD或YYYY-MM-DD)、datetime、pd.Timestamp
+        
+        Returns:
+            str: 下一个交易日，格式 YYYY-MM-DD
+        """
+        # 统一日期格式
+        if isinstance(date_input, str):
+            if len(date_input) == 8 and '-' not in date_input:
+                date_input = f"{date_input[:4]}-{date_input[4:6]}-{date_input[6:]}"
+            target_date = pd.to_datetime(date_input)
+        else:
+            target_date = pd.to_datetime(date_input)
+        
+        target_str = target_date.strftime('%Y-%m-%d')
+        
+        # 如果有交易日历数据，从中查找
+        if self.trading_days and len(self.trading_days) > 0:
+            try:
+                next_days = [d for d in self.trading_days if d > target_str]
+                if next_days:
+                    return next_days[0]
+            except Exception:
+                pass
+        
+        # 回退方案：简单加一天（只跳过周末）
+        next_date = target_date + timedelta(days=1)
+        while next_date.weekday() >= 5:
+            next_date += timedelta(days=1)
+        return next_date.strftime('%Y-%m-%d')
+    
     def get_prev_trading_day(self, trading_day):
         """
         根据交易日获取上一个交易日（即夜盘实际发生的自然日）
@@ -382,14 +422,18 @@ def get_trading_date_range(start_date, end_date):
     """获取实际的交易日期范围"""
     return trading_calendar.get_trading_date_range(start_date, end_date)
 
+def get_next_trading_day(date_input):
+    """获取指定日期之后的下一个交易日"""
+    return trading_calendar.get_next_trading_day(date_input)
+
 def get_prev_trading_day(trading_day):
     """根据交易日获取上一个交易日"""
     return trading_calendar.get_prev_trading_day(trading_day)
 
 def get_futures_data(
     symbol, 
-    start_date, 
-    end_date, 
+    start_date=None, 
+    end_date=None, 
     username=None, 
     password=None,
     kline_period='D', 
@@ -397,15 +441,28 @@ def get_futures_data(
     depth='no',
     use_cache=True,
     cache_dir='data_cache',
-    save_data=False
+    save_data=False,
+    start_time=None,
+    end_time=None,
+    limit=None
 ):
     """
     从API获取期货数据
     
+    支持三种请求方式（按优先级）:
+    1. 精确时间范围: start_time/end_time  (如 '2026-02-11 09:00:00')
+    2. 日期范围: start_date/end_date  (如 '2026-02-11')
+    3. BAR线数量: limit  (如 500，获取最近500根K线)
+    
+    可以组合使用:
+    - start_date + limit: 从某日期开始取N根
+    - start_time + limit: 从某时间开始取N根
+    - 仅 limit: 取最近N根
+    
     Args:
         symbol (str): 期货代码，如"AP888"
-        start_date (str): 开始日期，格式为"YYYY-MM-DD"
-        end_date (str): 结束日期，格式为"YYYY-MM-DD"
+        start_date (str): 开始日期，格式为"YYYY-MM-DD"（可选）
+        end_date (str): 结束日期，格式为"YYYY-MM-DD"（可选）
         username (str): API用户名/手机号
         password (str): API密码
         kline_period (str): K线周期，支持分钟(1M,5M等)、天(1D)、周(1W)、月(1Y)
@@ -414,6 +471,9 @@ def get_futures_data(
         use_cache (bool): 是否使用缓存数据
         cache_dir (str): 缓存目录
         save_data (bool): 是否保存数据，即使use_cache=False
+        start_time (str): 精确开始时间，格式为"YYYY-MM-DD HH:MM:SS"（可选）
+        end_time (str): 精确结束时间，格式为"YYYY-MM-DD HH:MM:SS"（可选）
+        limit (int): 请求的K线数量（可选，获取最近N根）
         
     Returns:
         pd.DataFrame: 包含OHLCV数据的DataFrame
@@ -447,6 +507,35 @@ def get_futures_data(
             return pd.DataFrame()
         
         try:
+            # 按数量获取 TICK 数据
+            if limit and not start_date and not end_date and not start_time and not end_time:
+                conn = sqlite3.connect(db_path, timeout=30)
+                cursor = conn.cursor()
+                cursor.execute(f"SELECT name FROM sqlite_master WHERE type='table' AND name='{table_name}'")
+                if not cursor.fetchone():
+                    print(f"❌ TICK表不存在: {table_name}")
+                    conn.close()
+                    return pd.DataFrame()
+                query = f"""
+                    SELECT * FROM (
+                        SELECT * FROM "{table_name}"
+                        ORDER BY datetime DESC
+                        LIMIT ?
+                    ) sub ORDER BY datetime ASC
+                """
+                data = pd.read_sql_query(query, conn, params=(limit,))
+                conn.close()
+                if data.empty:
+                    print(f"❌ TICK表无数据: {table_name}")
+                    return pd.DataFrame()
+                data['datetime'] = pd.to_datetime(data['datetime'], format='mixed')
+                data = data.set_index('datetime')
+                data['datetime'] = data.index
+                print(f"✅ 成功加载 {len(data)} 条TICK数据 (limit={limit})")
+                print(f"数据范围: {data.index[0]} 至 {data.index[-1]}")
+                print("="*80)
+                return data
+            
             data = read_from_sqlite(db_path, table_name)
             
             if data is None or data.empty:
@@ -466,13 +555,27 @@ def get_futures_data(
             # 转换datetime（支持带毫秒和不带毫秒的格式）
             data['datetime'] = pd.to_datetime(data['datetime'], format='mixed')
             
-            # 按日期筛选
-            start_dt = pd.to_datetime(start_date)
-            end_dt = pd.to_datetime(end_date) + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
-            data = data[(data['datetime'] >= start_dt) & (data['datetime'] <= end_dt)]
+            # 按时间/日期筛选
+            if start_time or end_time:
+                # 精确时间模式
+                tick_start = pd.to_datetime(start_time) if start_time else data['datetime'].min()
+                tick_end = pd.to_datetime(end_time) if end_time else data['datetime'].max()
+            elif start_date or end_date:
+                # 日期模式
+                tick_start = pd.to_datetime(start_date) if start_date else data['datetime'].min()
+                tick_end = (pd.to_datetime(end_date) + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)) if end_date else data['datetime'].max()
+            else:
+                tick_start = data['datetime'].min()
+                tick_end = data['datetime'].max()
+            
+            data = data[(data['datetime'] >= tick_start) & (data['datetime'] <= tick_end)]
+            
+            # 如果指定了 limit，截取最近 N 条
+            if limit and len(data) > limit:
+                data = data.tail(limit)
             
             if data.empty:
-                print(f"❌ 指定日期范围内没有TICK数据: {start_date} 至 {end_date}")
+                print(f"❌ 指定范围内没有TICK数据")
                 return pd.DataFrame()
             
             # 设置索引
@@ -497,18 +600,102 @@ def get_futures_data(
     if not username or not password:
         raise ValueError("必须提供API用户名和密码")
     
+    # ========== 判断请求模式 ==========
+    # 模式优先级: start_time/end_time > start_date/end_date > limit
+    use_limit_only = False
+    use_time_range = False
+    
+    if start_time or end_time:
+        # 模式A: 精确时间范围
+        use_time_range = True
+    elif start_date or end_date:
+        # 模式B: 日期范围（原有逻辑）
+        use_time_range = False
+    elif limit:
+        # 模式C: 仅按数量获取最近N根
+        use_limit_only = True
+    else:
+        raise ValueError("必须提供 start_date/end_date、start_time/end_time 或 limit 中的至少一个")
+    
     print("="*80)
     print(f"【数据请求开始】{symbol} {kline_period} {'后复权' if adjust_type == '1' else '不复权'}")
     print("="*80)
     
+    # ========== 模式C: 仅按数量获取 ==========
+    if use_limit_only:
+        print(f"请求模式: 按数量获取最近 {limit} 根K线")
+        data = fetch_data_from_api(symbol, None, None, username, password, 
+                                   kline_period, adjust_type, depth, limit=limit)
+        if data is not None and not data.empty:
+            if save_data:
+                db_path, table_name = get_cache_db_and_table(symbol, kline_period, cache_dir, adjust_type)
+                try:
+                    save_to_sqlite(data.reset_index(), db_path, table_name)
+                except Exception as e:
+                    print(f"缓存更新失败: {e}")
+            print(f"返回数据条数: {len(data)}")
+            print("="*80)
+            return data
+        else:
+            print("未能获取任何数据或数据为空")
+            print("="*80)
+            return pd.DataFrame()
+    
+    # ========== 模式A: 精确时间范围 ==========
+    if use_time_range:
+        _start = start_time or (start_date + ' 00:00:00' if start_date else None)
+        _end = end_time or (end_date + ' 23:59:59' if end_date else None)
+        print(f"请求模式: 精确时间范围")
+        print(f"  start_time: {_start or '(不限)'}")
+        print(f"  end_time: {_end or '(不限)'}")
+        if limit:
+            print(f"  limit: {limit}")
+        
+        data = fetch_data_from_api(symbol, None, None, username, password,
+                                   kline_period, adjust_type, depth,
+                                   start_time=_start, end_time=_end, limit=limit)
+        if data is not None and not data.empty:
+            if save_data:
+                db_path, table_name = get_cache_db_and_table(symbol, kline_period, cache_dir, adjust_type)
+                try:
+                    save_to_sqlite(data.reset_index(), db_path, table_name)
+                except Exception as e:
+                    print(f"缓存更新失败: {e}")
+            print(f"返回数据条数: {len(data)}")
+            print("="*80)
+            return data
+        else:
+            print("未能获取任何数据或数据为空")
+            print("="*80)
+            return pd.DataFrame()
+    
+    # ========== 模式B: 日期范围（原有逻辑）==========
     # 获取当前系统时间并显示
     current_date = pd.to_datetime(datetime.now().date())
+    print(f"请求模式: 日期范围")
     print(f"当前系统日期: {current_date.strftime('%Y-%m-%d')}")
     print(f"原始请求日期范围: {start_date} 到 {end_date}")
     
     # 转换日期字符串为datetime对象，用于比较
-    start_dt = pd.to_datetime(start_date)
-    end_dt = pd.to_datetime(end_date)
+    # 容错处理：如果日期无效（如2月31日），自动修正为月末
+    try:
+        start_dt = pd.to_datetime(start_date)
+    except Exception:
+        # 尝试取月初
+        start_dt = pd.to_datetime(start_date[:7] + '-01')
+    try:
+        end_dt = pd.to_datetime(end_date)
+    except Exception:
+        # 无效日期（如2月31日）→ 修正为该月最后一天
+        try:
+            year_month = end_date[:7]  # "2026-02"
+            end_dt = pd.to_datetime(year_month) + pd.offsets.MonthEnd(0)
+            end_date = end_dt.strftime('%Y-%m-%d')
+            print(f"日期修正: 无效日期 -> {end_date}")
+        except Exception:
+            end_dt = current_date
+            end_date = current_date.strftime('%Y-%m-%d')
+            print(f"日期修正: 使用当前日期 {end_date}")
     
     # 检查结束日期是否超过当前日期
     if end_dt > current_date:
@@ -842,13 +1029,14 @@ def get_futures_data(
     print(f"直接从API获取完整数据: {start_date} 到 {end_date}")
     data = fetch_data_from_api(symbol, start_date, end_date, username, password, kline_period, adjust_type, depth)
     
-    # 缓存数据
-    if data is not None and not data.empty and (use_cache or save_data):
-        db_path, table_name = get_cache_db_and_table(symbol, kline_period, cache_dir, adjust_type)
-        try:
-            save_to_sqlite(data.reset_index(), db_path, table_name)
-        except Exception as e:
-            print(f"缓存更新失败: {e}")
+    if data is not None and not data.empty:
+        # 可选：缓存数据到本地
+        if use_cache or save_data:
+            db_path, table_name = get_cache_db_and_table(symbol, kline_period, cache_dir, adjust_type)
+            try:
+                save_to_sqlite(data.reset_index(), db_path, table_name)
+            except Exception as e:
+                print(f"缓存更新失败: {e}")
         print(f"返回数据条数: {len(data)}")
         print("="*80)
         return data
@@ -857,213 +1045,134 @@ def get_futures_data(
         print("="*80)
         return pd.DataFrame()  # 返回空DataFrame而不是None
 
-def fetch_data_from_api(symbol, start_date, end_date, username, password, kline_period, adjust_type, depth, max_retries=3):
-    """从API获取数据的辅助函数"""
-    # 检查是否启用云端数据
+def _try_data_server_api(symbol, start_date=None, end_date=None, kline_period='1M', 
+                         adjust_type='0', depth='no',
+                         start_time=None, end_time=None, limit=None):
+    """
+    尝试从 data_server REST API 获取数据（鉴权通过后优先使用）
+    
+    data_server 负责从 1M 聚合为目标周期，客户端直接请求目标周期即可。
+    如果上层需要复权，在返回后由 apply_local_adjust() 进行本地复权。
+    
+    支持三种请求模式:
+    1. 精确时间范围: start_time/end_time
+    2. 日期范围: start_date/end_date
+    3. 按数量获取: limit
+    
+    Returns:
+        DataFrame（成功）或 None（data_server 无数据或不可用）
+    """
     try:
-        from ..config.trading_config import ENABLE_CLOUD_DATA
-        if not ENABLE_CLOUD_DATA:
-            print(f"⚠️ 云端数据已关闭 (ENABLE_CLOUD_DATA=False)，跳过API请求")
-            return pd.DataFrame()
-    except ImportError:
-        pass  # 配置不存在时默认启用
-    
-    # 检查日期是否为交易日
-    trading_start, trading_end = get_trading_date_range(start_date, end_date)
-    
-    if trading_start is None:
-        print(f"请求的日期范围 {start_date} 到 {end_date} 内没有交易日")
-        return pd.DataFrame()  # 返回空DataFrame而不是None
-    
-    # 使用调整后的交易日期范围
-    if trading_start != start_date or trading_end != end_date:
-        print(f"调整API请求为实际交易日: {trading_start} 到 {trading_end}")
-        start_date = trading_start
-        end_date = trading_end
-    
-    # 检查开始日期和结束日期是否相同（单日请求），如果是，扩展请求范围
-    if start_date == end_date:
-        print(f"检测到单日请求：{start_date}，尝试扩展请求范围以适配API")
+        from ..config._server_config import DATA_SERVER
+        api_url = DATA_SERVER.get('api_url', '')
         
-        # 向前扩展：获取前一个自然日（包含夜盘数据）
-        # 中国期货市场：1月22日的交易日数据包含1月21日21:00后的夜盘
-        prev_natural_day = (pd.to_datetime(start_date) - pd.Timedelta(days=1)).strftime('%Y-%m-%d')
-        print(f"扩展开始日期至前一天（包含夜盘）: {prev_natural_day} 到 {end_date}")
-        start_date = prev_natural_day
+        if not api_url:
+            return None
         
-        # 向后扩展：尝试获取下一个交易日（适配某些API要求）
-        next_trading_day = None
-        for i in range(1, 10):  # 最多尝试往后找10天
-            check_date = pd.to_datetime(end_date) + pd.Timedelta(days=i)
-            if is_trading_day(check_date):
-                next_trading_day = check_date.strftime('%Y-%m-%d')
-                break
+        url = f"{api_url.rstrip('/')}/api/futures/history"
         
-        if next_trading_day:
-            print(f"扩展结束日期至下一个交易日: {start_date} 到 {next_trading_day}")
-            end_date = next_trading_day
-    
-    # 检查结束日期是否超过当前日期
-    current_date = pd.to_datetime(datetime.now().date())
-    end_dt = pd.to_datetime(end_date)
-    if end_dt > current_date:
-        print(f"警告: API请求的结束日期 {end_date} 超过当前日期 {current_date.strftime('%Y-%m-%d')}，将使用当前日期作为结束日期")
-        end_date = current_date.strftime('%Y-%m-%d')
-    
-    # API配置
-    base_url = 'http://kanpan789.com:8086/ftdata'
-    
-    # 远程后复权开关控制（双重保险，已在 get_futures_data 入口处统一处理）
-    # 配置说明见: ssquant/config/trading_config.py 的 ENABLE_REMOTE_ADJUST
-    try:
-        from ..config.trading_config import ENABLE_REMOTE_ADJUST
-    except ImportError:
-        ENABLE_REMOTE_ADJUST = False
-    
-    if not ENABLE_REMOTE_ADJUST:
-        adjust_type = '0'
-    
-    # 构建请求参数
-    params = {
-        'username': username,
-        'password': password,
-        'symbol': symbol,
-        'start_date': start_date,
-        'end_date': end_date,
-        'kline_period': kline_period,
-        'adjust_type': adjust_type
-    }
-    
-    if depth:
-        params['Depth'] = depth
-    
-    print(f"API请求: {symbol} 从 {start_date} 到 {end_date}")
-    
-    # 添加重试逻辑
-    retries = 0
-    while retries < max_retries:
-        try:
-            # 发送请求，设置超时时间为300秒
-            response = requests.get(base_url, params=params, timeout=300)
-            
-            # 检查响应状态
-            if response.status_code == 200:
-                # 检查响应是否为JSON格式
-                if 'application/json' in response.headers.get('Content-Type', ''):
-                    data = pd.read_json(StringIO(response.text), orient='records')
-                    data = data.reset_index()
-                    
-                    # 列名排序
-                    if depth == 'yes':
-                        columns = ['datetime', 'symbol', 'open', 'high', 'low', 'close', 'volume', 'amount', 'openint', 'cumulative_openint', 'open_askp', 'open_bidp', 'close_askp', 'close_bidp', '开仓', '平仓', '多开', '空开', '多平', '空平', '双开', '双平', '双换', 'B', 'S', '未知']
-                    else:
-                        columns = ['datetime', 'symbol', 'open', 'high', 'low', 'close', 'volume', 'amount', 'openint', 'cumulative_openint', 'open_askp', 'open_bidp', 'close_askp', 'close_bidp']
-                    
-                    # 重新排列列名
-                    data = data.reindex(columns=[col for col in columns if col in data.columns])
-                    
-                    # 处理日期时间 - 确保是datetime对象并转换为北京时间
-                    data['datetime'] = pd.to_datetime(data['datetime'])
-                    
-                    # 如果datetime没有时区信息，假定为UTC时间，然后转换为北京时间
-                    if not isinstance(data['datetime'].dtype, pd.DatetimeTZDtype):
-                        data['datetime'] = data['datetime'].dt.tz_localize('UTC').dt.tz_convert('Asia/Shanghai')
-                    else:
-                        # 如果已经有时区信息，直接转换为北京时间
-                        data['datetime'] = data['datetime'].dt.tz_convert('Asia/Shanghai')
-                    
-                    # 移除时区信息，保持datetime格式统一
-                    data['datetime'] = data['datetime'].dt.tz_localize(None)
-                    
-                    # 将K线时间从收盘时间调整为开始时间（仅对分钟和小时周期）
-                    if kline_period.endswith('M'):  # 分钟线
-                        minutes = int(kline_period[:-1])
-                        data['datetime'] = data['datetime'] - pd.Timedelta(minutes=minutes)
-                    elif kline_period.endswith('H') or kline_period.lower() == '1h':  # 小时线
-                        hours = int(kline_period[:-1]) if kline_period.endswith('H') else 1
-                        data['datetime'] = data['datetime'] - pd.Timedelta(hours=hours)
-                    
-                    # 转换请求的日期范围为datetime对象进行过滤
-                    # 注意：end_date 需要包含当天全天的数据，所以加上 23:59:59
-                    start_dt = pd.to_datetime(start_date)
-                    end_dt = pd.to_datetime(end_date) + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
-                    
-                    # 检查API返回的数据范围
-                    original_data_len = len(data)
-                    
-                    if not data.empty:
-                        # 移除NaT值后再获取日期范围
-                        valid_dates = data['datetime'].dropna()
-                        if not valid_dates.empty:
-                            data_start = valid_dates.min().strftime('%Y-%m-%d')
-                            data_end = valid_dates.max().strftime('%Y-%m-%d')
-                        
-                        # 过滤数据，确保只包含请求的日期范围
-                        data = data[(data['datetime'] >= start_dt) & (data['datetime'] <= end_dt)]
-                        
-                        # 设置索引
-                        data.set_index('datetime', inplace=True)
-                        
-                        print(f"API请求成功: 获取到 {len(data)} 条记录")
-                        return data
-                    else:
-                        print("API返回空数据")
-                        return pd.DataFrame()
-                else:
-                    print("API响应格式错误：非JSON格式")
-                    return pd.DataFrame()
-            elif response.status_code == 500:
-                # 服务器内部错误处理
-                if retries < max_retries - 1:
-                    print(f"服务器内部错误，尝试重试 ({retries+1}/{max_retries})")
-                    retries += 1
-                    time.sleep(2)  # 等待2秒后重试
-                    continue
-                else:
-                    print(f"服务器内部错误，重试{max_retries}次后仍然失败")
-                    # 检查是否是时间范围过小导致的问题
-                    start_dt = pd.to_datetime(start_date)
-                    end_dt = pd.to_datetime(end_date)
-                    days_diff = (end_dt - start_dt).days
-                    if days_diff <= 3:
-                        print(f"请求的时间范围只有{days_diff}天，可能是周末或假期没有数据")
-                    return pd.DataFrame()
-            elif response.status_code == 401:
-                print("认证错误: 用户名和密码不能为空")
-                return pd.DataFrame()
-            elif response.status_code == 402:
-                print("认证错误: 账号不存在")
-                return pd.DataFrame()
-            elif response.status_code == 405:
-                print("认证错误: 账号已过期")
-                return pd.DataFrame()
-            elif response.status_code == 406:
-                print("认证错误: 密码错误")
-                return pd.DataFrame()
-            else:
-                print(f"API请求失败: 状态码 {response.status_code}")
-                if hasattr(response, 'json'):
-                    try:
-                        error_msg = response.json().get('error', '未知错误')
-                        print(f"错误信息: {error_msg}")
-                    except:
-                        print(f"无法解析错误信息")
-                return pd.DataFrame()
-                
-        except Exception as e:
-            if retries < max_retries - 1:
-                print(f"请求异常: {str(e)}，尝试重试 ({retries+1}/{max_retries})")
-                retries += 1
-                time.sleep(2)  # 等待2秒后重试
-                continue
-            else:
-                print(f"请求异常: {str(e)}，重试{max_retries}次后仍然失败")
-                return pd.DataFrame()
+        normalized_period = kline_period.strip().upper()
         
-        # 如果没有继续循环，就跳出
-        break
+        # 直接请求目标周期（data_server 服务端完成 1M→目标周期 的聚合）
+        params = {
+            'symbol': symbol.lower(),
+            'period': normalized_period,
+            'adjust_type': '0',
+        }
+        
+        # 根据请求模式填充参数
+        if start_time or end_time:
+            if start_time:
+                params['start_time'] = start_time
+            if end_time:
+                params['end_time'] = end_time
+            desc = f"({start_time or '...'}~{end_time or '...'})"
+        elif start_date or end_date:
+            if start_date:
+                params['start_date'] = start_date
+            if end_date:
+                params['end_date'] = end_date
+            desc = f"({start_date or '...'}~{end_date or '...'})"
+        else:
+            desc = ""
+        
+        if limit:
+            params['limit'] = limit
+            desc = f"(limit={limit})" if not desc else f"{desc} limit={limit}"
+        elif 'start_time' not in params and 'start_date' not in params:
+            params['limit'] = 5000
+            desc = "(limit=5000 default)"
+        
+        resp = requests.get(url, params=params, timeout=(5, 30))
+        if resp.status_code != 200:
+            return None
+        
+        result = resp.json()
+        if result.get('code') != 0:
+            return None
+        
+        data_obj = result.get('data', {})
+        records = data_obj.get('klines', []) if isinstance(data_obj, dict) else data_obj
+        if not records:
+            return None
+        
+        df = pd.DataFrame(records)
+        
+        if df.empty or 'datetime' not in df.columns:
+            return None
+        
+        df['datetime'] = pd.to_datetime(df['datetime'])
+        df = df.set_index('datetime')
+        df = df[~df.index.duplicated(keep='last')]
+        
+        print(f"[data_server API] 获取 {normalized_period} 数据: {symbol} {desc} {len(df)} 条")
+        
+        # 本地复权（当前为占位直通，后续实现算法后自动生效）
+        if adjust_type != '0':
+            from .local_adjust import apply_local_adjust
+            df = apply_local_adjust(df, symbol, kline_period, adjust_type)
+        
+        return df
+        
+    except requests.exceptions.ConnectionError:
+        return None
+    except Exception as e:
+        return None
+
+
+def fetch_data_from_api(symbol, start_date, end_date, username, password, 
+                        kline_period, adjust_type, depth, max_retries=3,
+                        start_time=None, end_time=None, limit=None):
+    """
+    从API获取数据的辅助函数
     
-    return pd.DataFrame()  # 如果所有重试都失败，返回空DataFrame而不是None
+    数据源: 仅使用 data_server API（kanpan789 仅用于鉴权，不用于数据获取）
+    
+    支持三种请求模式:
+    1. 精确时间范围: start_time/end_time
+    2. 日期范围: start_date/end_date
+    3. 按数量获取: limit
+    """
+    # ========== 鉴权检查 ==========
+    from .auth_manager import verify_auth
+    if not verify_auth(username, password):
+        from .auth_manager import get_auth_message
+        print(f"[数据请求] 鉴权失败: {get_auth_message()}，无法获取数据")
+        return pd.DataFrame()
+    
+    # ========== 从 data_server API 获取 ==========
+    ds_df = _try_data_server_api(symbol, start_date, end_date, kline_period, adjust_type, depth,
+                                  start_time=start_time, end_time=end_time, limit=limit)
+    if ds_df is not None:
+        return ds_df
+    
+    # data_server 不可用或无数据
+    req_desc = f"({start_time or start_date or ''}~{end_time or end_date or ''})"
+    if limit:
+        req_desc += f" limit={limit}"
+    print(f"[数据请求] data_server 无法获取 {symbol} {kline_period} {req_desc}")
+    print(f"[数据请求] 请确认 data_server 是否已启动，以及数据库中是否有对应数据")
+    return pd.DataFrame()
 
 def get_cache_db_and_table(symbol, kline_period, cache_dir, adjust_type):
     """获取缓存数据库路径和表名"""

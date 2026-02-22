@@ -260,6 +260,11 @@ class LiveDataSource:
         self.symbol = symbol
         self.config = config
         
+        # ========== K线数据源模式 ==========
+        # 'local' : 本地CTP Tick聚合K线（默认，原有行为）
+        # 'data_server': 由 data_server 远程推送已完成K线（WebSocket）
+        self.kline_source = config.get('kline_source', 'local')
+        
         # 持仓信息
         self.current_pos = 0  # 当前持仓 (正数多头，负数空头)
         self.today_pos = 0  # 今仓
@@ -328,7 +333,8 @@ class LiveDataSource:
         self.pending_orders = {}  # {OrderSysID: order_data}
         
         # 历史数据预加载
-        if config.get('preload_history', False):
+        # data_server 模式：历史数据通过 WebSocket preload 获取，不走本地预加载
+        if config.get('preload_history', False) and self.kline_source != 'data_server':
             self._preload_historical_data(config)
     
     def _preload_historical_data(self, config: Dict):
@@ -476,7 +482,11 @@ class LiveDataSource:
                 self.orders_to_resend[order_sys_id] = 0
                 
                 # 发送撤单请求
-                exchange_id = order.get('ExchangeID', 'SHFE')
+                exchange_id = order.get('ExchangeID', '')
+                if not exchange_id:
+                    # 智能推导交易所代码（兜底，正常情况 CTP 回报中已包含 ExchangeID）
+                    from ..pyctp.trader_api import _get_exchange_id
+                    exchange_id = _get_exchange_id(self.symbol) or 'SHFE'
                 if self.ctp_client:
                     self.ctp_client.cancel_order(self.symbol, order_sys_id, exchange_id)
 
@@ -531,15 +541,24 @@ class LiveDataSource:
             date_str = dt.now().strftime('%Y-%m-%d')
         
         datetime_str = f"{date_str} {update_time}.{millisec:03d}"
-        self.current_datetime = pd.to_datetime(datetime_str)
+        tick_datetime = pd.to_datetime(datetime_str)
+        
+        # data_server 模式：current_datetime 由 on_ws_kline 管理（K线整分钟时间）
+        # 本地模式：current_datetime 由 tick 驱动
+        if self.kline_source != 'data_server':
+            self.current_datetime = tick_datetime
         
         # 保存完整的CTP原始数据，只添加datetime字段
         tick_info = tick_data.copy()
-        tick_info['datetime'] = self.current_datetime
+        tick_info['datetime'] = tick_datetime
         
         self.ticks.append(tick_info)
         
-        # 聚合K线并返回完成的K线
+        # data_server 模式：不做本地K线聚合，K线由远程推送
+        if self.kline_source == 'data_server':
+            return None  # type: ignore
+        
+        # 本地模式：聚合K线并返回完成的K线
         return self._aggregate_kline(tick_data)
     
     def get_current_price(self) -> float:
@@ -564,9 +583,16 @@ class LiveDataSource:
         min_match = re.match(r'^(\d+)(m|min)$', period)
         if min_match:
             minutes = int(min_match.group(1))
-            # 向下取整到对应的分钟
-            new_minute = (dt.minute // minutes) * minutes
-            return dt.replace(minute=new_minute, second=0, microsecond=0)
+            if minutes < 60:
+                # 向下取整到对应的分钟
+                new_minute = (dt.minute // minutes) * minutes
+                return dt.replace(minute=new_minute, second=0, microsecond=0)
+            else:
+                # ≥60 分钟：用当天总分钟数做整除，支持 65m/80m/120m 等任意周期
+                total_minutes = dt.hour * 60 + dt.minute
+                period_start = (total_minutes // minutes) * minutes
+                new_hour, new_minute = divmod(period_start, 60)
+                return dt.replace(hour=new_hour, minute=new_minute, second=0, microsecond=0)
         
         # 匹配小时周期：1h, 2h, 1hour 等
         hour_match = re.match(r'^(\d+)(h|hour)$', period)
@@ -576,8 +602,17 @@ class LiveDataSource:
             return dt.replace(hour=new_hour, minute=0, second=0, microsecond=0)
         
         # 匹配日线：1d, d, day
+        # 日线归属规则：夜盘(21:00-23:59)归属当天，凌晨(00:00-02:30)归属前一天
+        # 即：一个交易日 = 当天09:00-15:15 + 当天21:00-23:59 + 次日00:00-02:30
         if period in ['1d', 'd', 'day']:
-            return dt.replace(hour=0, minute=0, second=0, microsecond=0)
+            hour = dt.hour
+            if hour < 5:
+                # 凌晨夜盘(00:00-02:30)：归属前一自然日（与前晚21:00同属一个交易日）
+                prev_day = dt - pd.Timedelta(days=1)
+                return prev_day.replace(hour=0, minute=0, second=0, microsecond=0)
+            else:
+                # 日盘(09:00-15:15) + 夜盘(21:00-23:59)：归属当天
+                return dt.replace(hour=0, minute=0, second=0, microsecond=0)
         
         # 默认1分钟
         return dt.replace(second=0, microsecond=0)
@@ -746,6 +781,105 @@ class LiveDataSource:
                 tick_list = tick_list[-window:]
         
         return pd.DataFrame(tick_list)
+    
+    # ========== data_server K线接收方法 ==========
+    
+    def on_ws_kline(self, kline_data: Dict) -> Optional[Dict]:
+        """
+        接收 data_server 推送的已完成K线（data_server 模式专用）
+        
+        Args:
+            kline_data: K线数据字典，包含 datetime, open, high, low, close, volume 等
+            
+        Returns:
+            如果是新K线，返回K线数据（触发策略+记录）
+            如果是更新已有K线（同一时间戳），返回 None（不触发策略）
+        """
+        # 转换datetime（如果是字符串）
+        dt = kline_data.get('datetime')
+        if isinstance(dt, str):
+            kline_data['datetime'] = pd.to_datetime(dt)
+        
+        # 更新当前价格和时间（确保策略能获取到正确的价格）
+        # 在 data_server 模式下，WS推送可能早于CTP Tick到达
+        # 必须用K线的 close 价格兜底，否则 current_price=0 导致下单价格异常
+        close_price = kline_data.get('close')
+        if close_price is not None and close_price > 0:
+            self.current_price = close_price
+        self.current_datetime = kline_data.get('datetime', self.current_datetime)
+        
+        # 去重：如果最后一根K线时间戳相同，则更新（而非追加）
+        # data_server 可能推送正在形成的K线更新，或重连后重叠推送
+        if self.klines and kline_data['datetime'] == self.klines[-1].get('datetime'):
+            self.klines[-1] = kline_data
+            # 更新 last_kline_time
+            self.last_kline_time = kline_data.get('datetime')
+            return None  # 更新已有K线，不触发策略
+        
+        # 新K线：追加
+        self.klines.append(kline_data)
+        self.kline_count += 1
+        self.current_idx = self.kline_count - 1
+        
+        # 更新 last_kline_time（用于状态一致性）
+        self.last_kline_time = kline_data.get('datetime')
+        
+        return kline_data
+    
+    def on_ws_history(self, klines_list: list):
+        """
+        接收 data_server 预加载的历史K线（data_server 模式专用）
+        
+        首次连接：直接加载全部历史
+        重连：只加载比已有数据更新的K线（避免重叠/倒序）
+        
+        Args:
+            klines_list: K线数据列表（时间正序，从旧到新）
+        """
+        if not klines_list:
+            return
+        
+        # 转换所有datetime
+        for kline in klines_list:
+            dt = kline.get('datetime')
+            if isinstance(dt, str):
+                kline['datetime'] = pd.to_datetime(dt)
+        
+        if not self.klines:
+            # 首次加载：直接全部追加
+            for kline in klines_list:
+                self.klines.append(kline)
+        else:
+            # 已有数据：只追加比最后一根更新的K线（处理重连重叠）
+            last_dt = self.klines[-1].get('datetime')
+            appended = 0
+            for kline in klines_list:
+                if last_dt is None or kline['datetime'] > last_dt:
+                    self.klines.append(kline)
+                    appended += 1
+            if appended > 0:
+                print(f"[LiveDataSource] 重连历史补充: +{appended} 条新K线 ({self.symbol})")
+        
+        # 更新计数器
+        self.kline_count = len(self.klines)
+        self.current_idx = max(0, self.kline_count - 1)
+        
+        # 更新 last_kline_time + 当前价格/时间
+        if self.klines:
+            last_kline = self.klines[-1]
+            self.last_kline_time = last_kline.get('datetime')
+            # 用最后一根历史K线的 close 初始化 current_price（避免策略读到 0）
+            close_price = last_kline.get('close')
+            if close_price is not None and close_price > 0:
+                self.current_price = close_price
+            self.current_datetime = last_kline.get('datetime', self.current_datetime)
+        
+        print(f"[LiveDataSource] ✅ 收到 data_server 历史K线 {len(klines_list)} 条 ({self.symbol})，缓存总计 {len(self.klines)} 条")
+        if self.klines:
+            last = self.klines[-1]
+            print(f"[LiveDataSource] 缓存最新K线: {last.get('datetime')} | "
+                  f"O:{last.get('open')} H:{last.get('high')} L:{last.get('low')} C:{last.get('close')} "
+                  f"V:{last.get('volume')}")
     
     def buy(self, volume: int = 1, reason: str = "", log_callback=None, order_type: str = 'bar_close', offset_ticks: Optional[int] = None, price: Optional[float] = None):
         """买入开仓
@@ -1153,7 +1287,10 @@ class LiveDataSource:
         for order in list(self.pending_orders.values()):
             if order.get('OrderSysID') and order.get('OrderStatus') in ['1', '3', 'a']:  # 部分成交/未成交/未知
                 # 从订单数据中获取交易所代码
-                exchange_id = order.get('ExchangeID', 'SHFE')  # 如果没有则默认上期所
+                exchange_id = order.get('ExchangeID', '')
+                if not exchange_id:
+                    from ..pyctp.trader_api import _get_exchange_id
+                    exchange_id = _get_exchange_id(self.symbol) or 'SHFE'
                 
                 if log_callback:
                     log_callback(f"[撤单] {self.symbol} 订单号={order['OrderSysID']} 交易所={exchange_id}")
@@ -1180,6 +1317,27 @@ class MultiDataSource:
     
     def __len__(self) -> int:
         return len(self.data_sources)
+
+
+def _normalize_period(period: str) -> str:
+    """
+    将K线周期标准化为 data_server 格式（大写）
+    
+    '1m', '1min' -> '1M'
+    '5m', '5min' -> '5M'
+    '15m' -> '15M'
+    '30m' -> '30M'
+    '1h', '60m', '1hour' -> '1H'
+    '1d', 'd', '1day' -> '1D'
+    """
+    import re
+    p = period.strip().lower()
+    p = re.sub(r'(\d+)min$', r'\1m', p)
+    p = re.sub(r'(\d+)hour$', r'\1h', p)
+    p = re.sub(r'(\d+)day$', r'\1d', p)
+    if p == 'd':
+        p = '1d'
+    return p.upper()
 
 
 class LiveTradingAdapter:
@@ -1322,12 +1480,25 @@ class LiveTradingAdapter:
         # TICK流支持（双驱动模式）
         self.enable_tick_callback = config.get('enable_tick_callback', False)
         
+        # ========== data_server WebSocket K线客户端 ==========
+        self.ws_kline_client = None
+        self._ws_subscription_map = {}  # (ws_symbol, period) -> LiveDataSource
+        self._strategy_lock = threading.Lock()  # 策略执行锁（防止CTP线程和WS线程并发调用）
+        self._kline_source = config.get('kline_source', 'local')
+        
         print(f"[实盘适配器] 初始化 - 模式: {mode}")
+        if self._kline_source == 'data_server':
+            print(f"[实盘适配器] ✓ K线数据源: data_server（远程推送模式）")
         if self.enable_tick_callback:
             print(f"[实盘适配器] ✓ TICK流双驱动模式已启用（每个tick和K线完成时都会触发策略）")
     
     def run(self) -> Dict[str, Any]:
         """运行实盘交易"""
+        # ========== 鉴权检查（kanpan789 验证账号） ==========
+        from ..data.auth_manager import verify_auth, get_auth_message
+        if not verify_auth():
+            raise RuntimeError(f"鉴权失败: {get_auth_message()}")
+        
         # 初始化CTP客户端
         self._init_ctp_client()
         
@@ -1336,6 +1507,10 @@ class LiveTradingAdapter:
         
         # 创建策略API
         self._create_strategy_api()
+        
+        # 初始化 data_server WebSocket K线客户端（如果启用）
+        if self._kline_source == 'data_server':
+            self._init_ws_kline_client()
         
         # 运行策略初始化
         if self.initialize_func:
@@ -1501,6 +1676,119 @@ class LiveTradingAdapter:
         # 创建多数据源容器(兼容回测API)
         self.multi_data_source = MultiDataSource(data_sources)
     
+    def _init_ws_kline_client(self):
+        """初始化 data_server WebSocket K线客户端"""
+        from ..data.ws_kline_client import WSKlineClient, WEBSOCKET_AVAILABLE
+        from ..data.contract_mapper import ContractMapper
+        
+        if not WEBSOCKET_AVAILABLE:
+            print("[实盘适配器] ❌ websocket-client 未安装，无法使用 data_server K线模式")
+            print("[实盘适配器]    请运行: pip install websocket-client")
+            print("[实盘适配器]    回退到本地K线聚合模式")
+            self._kline_source = 'local'
+            # 回退: 设置所有数据源为local模式
+            for ds in self.multi_data_source.data_sources:
+                ds.kline_source = 'local'
+            return
+        
+        # 获取 data_server 配置
+        ds_config = self.config.get('data_server', {})
+        ws_url = ds_config.get('ws_url', 'ws://localhost:8087')
+        preload_count = ds_config.get('preload_count', 100)
+        auto_reconnect = ds_config.get('auto_reconnect', True)
+        reconnect_interval = ds_config.get('reconnect_interval', 5.0)
+        
+        print(f"\n[实盘适配器] 连接 data_server: {ws_url}")
+        
+        # 创建客户端
+        self.ws_kline_client = WSKlineClient(
+            ws_url=ws_url,
+            auto_reconnect=auto_reconnect,
+            reconnect_interval=reconnect_interval,
+        )
+        
+        # 设置回调
+        self.ws_kline_client.on_kline = self._on_ws_kline
+        self.ws_kline_client.on_history = self._on_ws_history
+        
+        # 连接
+        connected = self.ws_kline_client.connect(timeout=10.0)
+        
+        if not connected:
+            print("[实盘适配器] ⚠️ data_server 连接超时，将在后台继续重连")
+        
+        # 为每个数据源订阅K线
+        for ds in self.multi_data_source.data_sources:
+            if ds.kline_source != 'data_server':
+                continue
+            
+            # 推导 WebSocket 订阅合约: 具体合约 → 主连(888)
+            ws_symbol = ContractMapper.get_continuous_symbol(ds.symbol).lower()
+            period = _normalize_period(ds.kline_period)
+            
+            # 建立映射: (ws_symbol, period) -> LiveDataSource
+            map_key = (ws_symbol, period)
+            self._ws_subscription_map[map_key] = ds
+            
+            # 订阅
+            self.ws_kline_client.subscribe_kline(
+                symbol=ws_symbol,
+                period=period,
+                preload=preload_count,
+            )
+            
+            print(f"  订阅: {ws_symbol} {period} (preload={preload_count}) → 数据源 {ds.symbol}")
+        
+        print(f"[实盘适配器] data_server K线订阅完成\n")
+    
+    def _on_ws_kline(self, symbol: str, period: str, kline_data: Dict):
+        """
+        data_server WebSocket K线推送回调
+        
+        当 data_server 推送一根已完成的K线时触发
+        """
+        # 查找对应的 LiveDataSource
+        map_key = (symbol.lower(), period.upper())
+        ds = self._ws_subscription_map.get(map_key)
+        
+        if not ds:
+            return
+        
+        # 添加到数据源的K线缓存
+        completed_kline = ds.on_ws_kline(kline_data)
+        
+        # 仅在新K线到达时才记录+触发策略（重复K线更新返回None，跳过）
+        if completed_kline:
+            # 记录K线数据（如果启用了数据保存）
+            recorder_key = f"{ds.symbol}_{ds.kline_period}"
+            if recorder_key in self.data_recorders:
+                self.data_recorders[recorder_key].record_kline(completed_kline)
+            
+            # 触发策略执行（仅在非TICK回调模式下）
+            # TICK回调模式下，策略已经由 _on_market_data 的每个tick触发
+            if self.running and not self.enable_tick_callback:
+                try:
+                    with self._strategy_lock:
+                        self.strategy_func(self.api)
+                except Exception as e:
+                    print(f"[策略执行错误] (WS K线触发) {e}")
+                    import traceback
+                    traceback.print_exc()
+    
+    def _on_ws_history(self, symbol: str, period: str, klines_list: list):
+        """
+        data_server WebSocket 历史K线预加载回调
+        """
+        # 查找对应的 LiveDataSource
+        map_key = (symbol.lower(), period.upper())
+        ds = self._ws_subscription_map.get(map_key)
+        
+        if not ds:
+            return
+        
+        # 加载历史K线到数据源
+        ds.on_ws_history(klines_list)
+    
     def _create_strategy_api(self):
         """创建策略API"""
         context = {
@@ -1574,16 +1862,18 @@ class LiveTradingAdapter:
         
         # 双驱动模式：TICK流 + K线完成
         try:
-            # 1. TICK级回调（如果启用）
-            if self.enable_tick_callback:
-                # 每个tick都执行策略（高频模式）
-                self.strategy_func(self.api)
-            
-            # 2. K线完成时回调（始终触发）
-            if completed_kline is not None:
-                # 如果没有启用TICK流，则在K线完成时执行策略
-                if not self.enable_tick_callback:
+            with self._strategy_lock:
+                # 1. TICK级回调（如果启用）
+                if self.enable_tick_callback:
+                    # 每个tick都执行策略（高频模式）
                     self.strategy_func(self.api)
+                
+                # 2. K线完成时回调（仅本地聚合模式触发）
+                # data_server 模式：completed_kline 始终为 None，K线由 _on_ws_kline 触发
+                if completed_kline is not None:
+                    # 如果没有启用TICK流，则在K线完成时执行策略
+                    if not self.enable_tick_callback:
+                        self.strategy_func(self.api)
         except Exception as e:
             print(f"[策略执行错误] {e}")
             import traceback
@@ -1628,9 +1918,9 @@ class LiveTradingAdapter:
         # 更新持仓：找到对应的数据源
         # 支持旧合约成交：如果数据源的 _old_contract 与成交合约匹配，也进行更新
         for ds in self.multi_data_source.data_sources:
-            # 精确匹配或旧合约匹配
+            # 精确匹配或旧合约匹配（大小写不敏感）
             old_contract = getattr(ds, '_old_contract', None)
-            is_match = (ds.symbol == symbol) or (old_contract and old_contract.upper() == symbol.upper())
+            is_match = (ds.symbol.upper() == symbol.upper()) or (old_contract and old_contract.upper() == symbol.upper())
             if is_match:
                 volume = data['Volume']
                 direction_flag = data['Direction']
@@ -1822,9 +2112,9 @@ class LiveTradingAdapter:
         order_sys_id = data.get('OrderSysID', '')
         order_status = data['OrderStatus']
         
-        # 找到对应的数据源并更新pending_orders
+        # 找到对应的数据源并更新pending_orders（大小写不敏感匹配）
         for ds in self.multi_data_source.data_sources:
-            if ds.symbol == symbol:
+            if ds.symbol.upper() == symbol.upper():
                 if order_sys_id:
                     # 如果订单全部成交或撤单，从pending_orders中删除
                     if order_status in ['0', '5']:  # 全部成交或撤单
@@ -1896,9 +2186,9 @@ class LiveTradingAdapter:
         print(f"\n🚫 [撤单成功] {time_str} {symbol} {direction}{offset} "
               f"价格={price:.2f} 数量={volume_original} 已成交={volume_traded} 订单号={order_sys_id}")
         
-        # 智能追单逻辑
+        # 智能追单逻辑（大小写不敏感匹配）
         for ds in self.multi_data_source.data_sources:
-            if ds.symbol == symbol and order_sys_id in ds.orders_to_resend:
+            if ds.symbol.upper() == symbol.upper() and order_sys_id in ds.orders_to_resend:
                 retry_count = ds.orders_to_resend.pop(order_sys_id)
                 
                 if retry_count < ds.retry_limit:
@@ -2254,7 +2544,13 @@ class LiveTradingAdapter:
         print("\n[实盘适配器] 停止运行...")
         self.running = False
         
-        # 保存所有数据源的当前未完成K线
+        # 关闭 data_server WebSocket 客户端
+        if self.ws_kline_client:
+            print("[实盘适配器] 断开 data_server WebSocket...")
+            self.ws_kline_client.close()
+            self.ws_kline_client = None
+        
+        # 保存所有数据源的当前未完成K线（仅本地聚合模式有 current_kline）
         if self.multi_data_source:
             for ds in self.multi_data_source.data_sources:
                 recorder_key = f"{ds.symbol}_{ds.kline_period}"

@@ -75,6 +75,16 @@ from .contract_info import (
     list_varieties,
 )
 
+from .ws_kline_client import (
+    # WebSocket K线客户端
+    WSKlineClient,
+)
+
+from .multi_period import (
+    # 多周期K线本地聚合器
+    MultiPeriodAggregator,
+)
+
 __all__ = [
     # API数据获取
     'get_futures_data',
@@ -99,4 +109,10 @@ __all__ = [
     'get_contract_service',
     'refresh_contracts',
     'list_varieties',
+    
+    # WebSocket K线客户端
+    'WSKlineClient',
+    
+    # 多周期K线本地聚合器
+    'MultiPeriodAggregator',
 ] 

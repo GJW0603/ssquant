@@ -8,6 +8,7 @@
 [![PyPI](https://img.shields.io/pypi/v/ssquant.svg)](https://pypi.org/project/ssquant/)
 [![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
 [![License](https://img.shields.io/badge/license-Non--Commercial-red.svg)](LICENSE)
+[![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux-lightgrey.svg)]()
 
 [GitHub](https://github.com/songshuquant/ssquant) | [Gitee（国内推荐）](https://gitee.com/ssquant/ssquant)
 
@@ -22,8 +23,9 @@
 ### ✅ 统一的策略框架
 
 - **一套代码三处运行** - 同一份策略代码可在回测、SIMNOW模拟、实盘CTP三种环境下运行
-- **完整的数据支持** - K线数据（1m/5m/15m/30m/1h/4h/1d）+ TICK逐笔数据
+- **完整的数据支持** - K线数据（任意周期：1m/2m/5m/15m/30m/1h/4h/1d...）+ TICK逐笔数据
 - **多品种多周期** - 同时交易多个品种，使用不同周期数据
+- **跨平台支持** - 支持 Windows 和 Linux 系统
 
 ### ✅ 强大的交易功能
 
@@ -31,6 +33,16 @@
 - **智能算法交易** - 支持限价单排队、超时撤单、追价重发等高级逻辑
 - **实时回调系统** - on_trade/on_order/on_cancel 实时通知
 - **TICK流双驱动** - K线驱动 + TICK驱动两种模式
+- **断线自动重连** - CTP连接断开后自动重连，认证失败自动重试
+
+### ✅ 灵活的数据获取
+
+- **三种数据请求方式**：
+  - 日期范围：`start_date` / `end_date`
+  - 精确时间：`start_time` / `end_time`
+  - K线数量：`limit`（获取最近N根K线）
+- **本地K线派生** - 从1M自动派生任意周期（2M/7M/65M/120M等）
+- **远程数据推送** - 支持 data_server WebSocket 实时K线推送
 
 ### ✅ 丰富的策略示例
 
@@ -40,11 +52,65 @@
 
 ---
 
+## 📡 数据服务器（v0.4.2 重大升级）
+
+### 🆕 全新 data_server 架构
+
+v0.4.2 版本对远程数据服务进行了**重大升级**，新增独立的 `data_server` 数据服务器：
+
+| 功能 | 说明 |
+|------|------|
+| **实时K线推送** | WebSocket 实时推送1分钟K线，毫秒级延迟 |
+| **历史K线补全** | 连接时自动预加载历史K线，无缝衔接 |
+| **订单流数据** | 新增12个订单流字段，支持量价分析策略 |
+| **多周期派生** | 服务端1M推送 + 客户端任意周期聚合 |
+| **断线自动重连** | 网络中断后自动重连，数据不丢失 |
+
+### 📊 订单流数据字段
+
+新增完整的订单流数据支持，可用于量价分析、主力资金追踪等策略：
+
+```python
+# 订单流字段（K线数据中自动包含）
+'开仓'    # 总开仓量
+'平仓'    # 总平仓量
+'多开'    # 多头开仓
+'空开'    # 空头开仓
+'多平'    # 多头平仓
+'空平'    # 空头平仓
+'双开'    # 双开（多空同时开仓）
+'双平'    # 双平（多空同时平仓）
+'双换'    # 双换（换手）
+'B'       # 主买量（Buy）
+'S'       # 主卖量（Sell）
+'未知'    # 未知方向
+```
+
+### 🔄 实时K线推送模式
+
+```python
+# 启用 data_server 实时K线推送
+config = get_config(
+    mode=RunMode.SIMNOW,
+    symbol='rb2601',
+    kline_period='1m',
+    kline_source='data_server',  # 使用远程实时推送
+)
+```
+
+**工作流程：**
+1. 连接 data_server WebSocket 服务器
+2. 自动预加载最近 N 根历史K线（可配置）
+3. 实时接收1分钟K线推送
+4. 客户端本地派生任意周期（5M/15M/1H/1D等）
+
+---
+
 ## 🖥️ 系统要求
 
 | 项目 | 要求 |
 |------|------|
-| **操作系统** | Windows 10+（⚠️ 目前仅支持 Windows，Linux 版本待更新） |
+| **操作系统** | Windows 10+ / Linux (x86_64) |
 | **Python** | 3.9 ~ 3.14 |
 | **CTP版本** | 6.7.7 ~ 6.7.10 |
 | **内存** | 4GB+ |
@@ -55,11 +121,17 @@
 
 ### 1. 安装
 
-从 GitHub/Gitee 源码安装
+**方式一：从 PyPI 安装**
+
+```bash
+pip install ssquant
+```
+
+**方式二：从 GitHub/Gitee 源码安装（推荐）**
 
 如果您下载了源码压缩包（通常解压后文件夹名为 `ssquant-main`），或者通过 git clone 拉取了代码：
 
-1. 打开终端（CMD/PowerShell），进入该文件夹（确保能看到 `setup.py` 文件）。
+1. 打开终端（CMD/PowerShell/Bash），进入该文件夹（确保能看到 `setup.py` 文件）。
 2. 运行安装命令：
 
 ```bash
@@ -69,6 +141,58 @@ pip install -e .
 > **注意**：
 > - 命令最后有一个点 `.`，代表当前目录，不要漏掉。
 > - 文件夹名字（如 `ssquant-main`）不影响安装，只要目录结构正确即可。
+
+#### 🔄 更新到最新版本
+
+**方式一：Git 更新（推荐）**
+
+如果你是通过 `git clone` 安装的，可以用以下命令更新到最新版本：
+
+```bash
+# 1. 进入项目目录
+cd ssquant
+
+# 2. 拉取最新代码
+git pull origin main
+
+# 3. 重新安装（更新依赖）
+pip install -e .
+```
+
+**完整的首次克隆 + 安装流程：**
+
+```bash
+# GitHub
+git clone https://github.com/songshuquant/ssquant.git
+cd ssquant
+pip install -e .
+
+# 或 Gitee（国内推荐，速度更快）
+git clone https://gitee.com/ssquant/ssquant.git
+cd ssquant
+pip install -e .
+```
+
+> 💡 **提示**：使用 `pip install -e .`（开发模式）安装后，`git pull` 拉取的代码更新会立即生效，无需重复安装。
+
+**方式二：下载压缩包重新安装**
+
+如果你是下载源码压缩包安装的，需要重新下载最新版本：
+
+1. 从 [GitHub Releases](https://github.com/songshuquant/ssquant/releases) 或 [Gitee](https://gitee.com/ssquant/ssquant) 下载最新压缩包
+2. 解压到新目录
+3. 进入目录执行安装：
+
+```bash
+cd ssquant-main
+pip install -e .
+```
+
+**方式三：PyPI 更新**
+
+```bash
+pip install ssquant --upgrade
+```
 
 #### ❓ 常见问题：ModuleNotFoundError: No module named 'ssquant'
 
@@ -85,12 +209,13 @@ ModuleNotFoundError: No module named 'ssquant'
 1. 检查是否已安装：
    ```bash
    pip list | findstr ssquant   # Windows
+   pip list | grep ssquant      # Linux
    ```
 
 2. 如果没有找到，重新安装：
    ```bash
-   
-   # 从源码安装（在项目目录下执行）
+   pip install ssquant
+   # 或从源码安装（在项目目录下执行）
    pip install -e .
    ```
 
@@ -108,9 +233,9 @@ ModuleNotFoundError: No module named 'ssquant'
 框架使用**松鼠俱乐部会员远程数据库**，会员填入账号密码后，回测和实盘自动预拉取数据到本地：
 
 ```python
-# ========== 数据API认证 (松鼠俱乐部会员) ==========
-API_USERNAME = "你的会员账号"
-API_PASSWORD = "你的会员密码"
+# ========== 远程数据API认证 quant789.com(松鼠俱乐部会员) ==========
+API_USERNAME = "你的会员账号"    # 鉴权账号 (您的俱乐部手机号或邮箱)
+API_PASSWORD = "你的会员密码"    # 鉴权密码
 ```
 
 > 💡 **非会员用户**：
@@ -193,7 +318,46 @@ if __name__ == "__main__":
     results = runner.run(strategy=my_strategy)
 ```
 
-### 4. 切换模式只需改配置
+### 4. 多种数据请求方式
+
+```python
+# ===== 方式1：日期范围 =====
+config = get_config(
+    mode=RunMode.BACKTEST,
+    symbol='rb888',
+    start_date='2025-01-01',
+    end_date='2025-11-30',
+    kline_period='1h',
+)
+
+# ===== 方式2：精确时间范围 =====
+config = get_config(
+    mode=RunMode.BACKTEST,
+    symbol='au888',
+    kline_period='1m',
+    start_time='2026-02-10 09:00:00',
+    end_time='2026-02-14 15:00:00',
+)
+
+# ===== 方式3：获取最近N根K线 =====
+config = get_config(
+    mode=RunMode.BACKTEST,
+    symbol='au888',
+    kline_period='5m',
+    limit=1000,  # 获取最近1000根K线
+)
+
+# ===== 方式4：从某日期开始取N根 =====
+config = get_config(
+    mode=RunMode.BACKTEST,
+    symbol='au888',
+    kline_period='5m',
+    start_date='2026-01-01',
+    limit=500,
+)
+```
+
+### 5. 切换运行模式
 
 ```python
 # ===== 回测模式 =====
@@ -233,11 +397,12 @@ config = get_config(
 | [用户手册.md](用户手册.md) | 📖 完整使用教程 | 新手必读 |
 | [API参考手册.md](API参考手册.md) | 📚 详细API说明 | 开发查询 |
 | [文档导航.md](文档导航.md) | 📑 所有文档索引 | 查找文档 |
+
 ---
 
 ## 🎓 示例策略
 
-所有示例在 `examples/` 目录（共19个）：
+所有示例在 `examples/` 目录（共 **21个**，v0.4.2 新增 2个）：
 
 ### 工具类 (A_开头)
 
@@ -247,6 +412,7 @@ config = get_config(
 | `A_工具_数据库管理_查看与删除.py` | 数据库管理 |
 | `A_撤单重发示例.py` | 订单撤单重发机制 |
 | `A_穿透式测试脚本.py` | CTP穿透式认证测试 |
+| `A_CTP连接状态检测器_含实盘配置.py` | 🆕 CTP连接状态检测 |
 
 ### 策略类 (B_开头)
 
@@ -264,6 +430,7 @@ config = get_config(
 | `B_多品种多周期交易策略.py` | 多品种多周期 |
 | `B_多品种多周期交易策略_参数优化.py` | 参数优化示例 |
 | `B_机器学习策略_随机森林.py` | ML机器学习预测 |
+| `B_auto_params_demo.py` | 合约参数自动获取演示 |
 
 ### 高级类 (C_开头)
 
@@ -272,6 +439,18 @@ config = get_config(
 | `C_期权交易策略.py` | 期权交易 |
 | `C_期货期权组合策略.py` | 期货期权组合 |
 | `C_纯Tick高频交易策略.py` | TICK流高频交易 |
+| `C_纯Tick限价单交易策略.py` | 🆕 限价单 + 智能追单演示 |
+
+### 🆕 data_server 模式 (D_开头)
+
+| 文件 | 说明 |
+|------|------|
+| `D_订单流与深度数据_data_server模式.py` | 🆕 **订单流数据交易策略** |
+
+> **订单流策略说明**：
+> - 利用 data_server 提供的 **12个订单流字段** 和 **盘口深度数据**
+> - 多因子评分体系：订单流动量 + 主动买卖 + 资金流向 + 盘口压力
+> - 仅 data_server 模式可用（本地聚合模式不包含订单流数据）
 
 ---
 
@@ -330,16 +509,23 @@ ssquant-main/                   # 📁 项目根目录
 │   │   ├── backtest_core.py    # 回测核心
 │   │   └── live_trading_adapter.py  # 实盘适配器
 │   ├── config/                 # 配置管理
-│   │   └── trading_config.py   # 配置生成（账户配置在此）
+│   │   ├── trading_config.py   # 配置生成（账户配置在此）
+│   │   └── _server_config.py   # data_server 连接配置
 │   ├── data/                   # 数据管理
 │   │   ├── api_data_fetcher.py # API数据获取
-│   │   └── local_data_loader.py # 本地数据加载
+│   │   ├── local_data_loader.py # 本地数据加载
+│   │   ├── ws_kline_client.py  # WebSocket K线客户端
+│   │   ├── multi_period.py     # 多周期K线派生器
+│   │   ├── auth_manager.py     # 鉴权管理器
+│   │   └── local_adjust.py     # 本地复权模块
 │   ├── ctp/                    # CTP二进制文件
 │   │   ├── py39/ ~ py314/      # 各Python版本的CTP文件
-│   │   └── loader.py           # CTP加载器
+│   │   │   ├── *.pyd / *.dll   # Windows 二进制
+│   │   │   └── *.so            # Linux 二进制
+│   │   └── loader.py           # CTP加载器（自动识别平台）
 │   ├── pyctp/                  # CTP封装
-│   │   ├── simnow_client.py    # SIMNOW客户端
-│   │   └── real_trading_client.py  # 实盘客户端
+│   │   ├── simnow_client.py    # SIMNOW客户端（断线重连）
+│   │   └── real_trading_client.py  # 实盘客户端（断线重连）
 │   └── indicators/             # 技术指标
 │       └── tech_indicators.py
 │
@@ -407,7 +593,7 @@ api.buy(volume=1, index=1)
 ## 🔧 系统要求
 
 - **Python**: 3.9 ~ 3.14
-- **系统**: Windows 10+（⚠️ 目前仅支持 Windows，Linux 版本待更新）
+- **系统**: Windows 10+ / Linux (x86_64)
 - **内存**: 4GB+
 - **网络**: 稳定连接（实盘/SIMNOW）
 
@@ -415,14 +601,22 @@ api.buy(volume=1, index=1)
 
 框架内置 CTP 6.7.7 ~ 6.7.10 版本，位于 `ssquant/ctp/pyXXX/` 目录：
 
-| Python版本 | 目录 | 状态 |
-|-----------|------|------|
-| 3.9 | `py39/` | ✅ 已包含 |
-| 3.10 | `py310/` | ✅ 已包含 |
-| 3.11 | `py311/` | ✅ 已包含 |
-| 3.12 | `py312/` | ✅ 已包含 |
-| 3.13 | `py313/` | ✅ 已包含 |
-| 3.14 | `py314/` | ✅ 已包含 |
+| Python版本 | 目录 | Windows | Linux |
+|-----------|------|---------|-------|
+| 3.9 | `py39/` | ✅ .pyd + .dll | ✅ .so |
+| 3.10 | `py310/` | ✅ .pyd + .dll | ✅ .so |
+| 3.11 | `py311/` | ✅ .pyd + .dll | ✅ .so |
+| 3.12 | `py312/` | ✅ .pyd + .dll | ✅ .so |
+| 3.13 | `py313/` | ✅ .pyd + .dll | ✅ .so |
+| 3.14 | `py314/` | ✅ .pyd + .dll | ✅ .so |
+
+### Linux 使用说明
+
+Linux 系统首次使用时，框架会自动预加载 CTP 运行库。如遇问题，可手动设置：
+
+```bash
+export LD_LIBRARY_PATH=/path/to/ssquant/ctp/py3xx:$LD_LIBRARY_PATH
+```
 
 ---
 
@@ -448,6 +642,30 @@ api.buy(volume=1, index=1)
 ---
 
 ## 📝 更新日志
+
+### v0.4.2 (2026-02-22) 🚀 Linux支持 & 数据服务器重大升级
+
+#### 📡 数据服务器升级（重点）
+
+| 更新项 | 改进内容 | 效果 |
+|-------|---------|------|
+| **🆕 全新 data_server** | 独立数据服务器架构 | 更稳定、更快速的数据服务 |
+| **📊 订单流数据** | 新增12个订单流字段 | 支持开仓/平仓/多开/空开/双开/B/S等 |
+| **⚡ 实时K线推送** | WebSocket 毫秒级推送 | 实盘K线实时更新，无延迟 |
+| **🔄 历史K线补全** | 连接时自动预加载 | 策略启动即有完整历史数据 |
+| **📈 多周期本地派生** | 1M→任意周期聚合 | 支持 2M/7M/65M/120M 等任意周期 |
+
+#### 🐧 平台与功能
+
+| 更新项 | 改进内容 | 效果 |
+|-------|---------|------|
+| **Linux 平台支持** | 新增 CTP Linux 二进制文件 (.so) | 支持在 Linux 服务器运行实盘 |
+| **鉴权管理** | 新增 auth_manager 模块 | 通过 data_server 代理验证身份 |
+| **精确时间请求** | start_time/end_time/limit 参数 | 三种数据请求方式灵活组合 |
+| **断线重连优化** | 认证失败自动重试，详细日志 | CTP 连接稳定性大幅提升 |
+| **日线归属修复** | 凌晨夜盘归属前一自然日 | 日线聚合逻辑更准确 |
+
+详细更新内容请查看 [042.MD](042.MD)
 
 ### v0.4.1 (2026-02-04) 🐛 平今平昨Bug修复
 

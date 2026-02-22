@@ -962,6 +962,11 @@ class MultiDataSource:
         if len(self.data_sources) <= 1:
             return  # 只有一个或没有数据源，不需要对齐
             
+        # 去除重复索引（数据库可能存在重复行）
+        for ds in self.data_sources:
+            if not ds.data.empty and ds.data.index.duplicated().any():
+                ds.data = ds.data[~ds.data.index.duplicated(keep='last')]
+        
         # 收集所有数据源的索引
         all_indices = []
         for ds in self.data_sources:

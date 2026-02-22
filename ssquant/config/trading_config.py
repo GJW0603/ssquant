@@ -24,26 +24,17 @@ def _get_contract_params(symbol: str) -> dict:
     return _contract_service(symbol)
 
 
-# ========== 数据API认证 (quant789.com) ==========
-# 默认使用松鼠Quant俱乐部远程数据服务器
-# 如需修改服务器地址，请编辑 ssquant/data/api_data_fetcher.py 第667行的 base_url
-API_USERNAME = ""              # 数据API账号 (您的俱乐部手机号或邮箱)
-API_PASSWORD = ""            # 数据API密码 (密码)
+# ========== 远程数据API认证 quant789.com(松鼠俱乐部会员) ========== 小松鼠VX：viquant01
+API_USERNAME = ""              # 鉴权账号 (您的俱乐部手机号或邮箱)
+API_PASSWORD = ""            # 鉴权密码 
 
-# ========== 云端数据开关 ==========
-# 控制是否从云服务器请求数据（当本地缓存不存在或不完整时）
-# True: 本地无数据时自动从云端获取（默认）
-# False: 仅使用本地缓存，不请求云端
-ENABLE_CLOUD_DATA = True
+# ========== 复权设置 ==========
+# 复权数据处理策略:
+#   - data_server（远程服务器）只存储不复权(raw)数据
+#   - 从 data_server 获取数据后，由框架本地进行复权计算
+#   - 本地复权算法位于: ssquant/data/local_adjust.py（当前为占位直通，后续实现）
+ENABLE_REMOTE_ADJUST = False
 
-# ========== 远程数据复权设置 ==========
-# 【重要】远程数据服务器升级中，暂不支持后复权数据
-# 当此开关为 False 时，无论配置 adjust_type 为何值，实际请求都会使用 '0'（不复权）
-# 
-# 控制位置: ssquant/data/api_data_fetcher.py 的 get_futures_data() 和 fetch_data_from_api() 函数
-# 
-# 服务器恢复后启用后复权，只需将下方开关改为 True 即可
-ENABLE_REMOTE_ADJUST = False  # 是否启用远程后复权请求（服务器升级中，暂时关闭）
 
 # ========== 回测默认配置 ==========
 BACKTEST_DEFAULTS = {
@@ -66,8 +57,8 @@ BACKTEST_DEFAULTS = {
     'lookback_bars': 0,           # K线回溯窗口大小，0表示不限制（返回全部历史数据），建议设置500-2000
     
     # -------- 缓存与调试 --------
-    'use_cache': True,              # 是否使用本地缓存数据
-    'save_data': True,              # 是否保存数据到本地缓存
+    'use_cache': False,              # 是否使用本地缓存数据
+    'save_data': False,              # 是否保存数据到本地缓存
     'debug': False,                 # 是否开启调试模式
 }
 
@@ -102,14 +93,17 @@ ACCOUNTS = {
         # 'history_symbol': 'rb888',      # 自定义历史数据源 (默认自动推导为主力XXX888)
                                          # 跨期套利时可指定: 主力用'rb888', 次主力用'rb777'
         
+        # K线数据源配置
+        # 'kline_source': 'local',        # K线数据源: 'local'(默认,CTP本地聚合) 或 'data_server'(远程推送)
+        
         # 回调配置
         'enable_tick_callback': False,     # 是否启用TICK回调 (实时行情推送)
         
         # 数据保存配置 (默认全部关闭)
-        'save_kline_csv': True,           # 是否保存K线到CSV文件
+        'save_kline_csv': False,           # 是否保存K线到CSV文件
         'save_kline_db': True,            # 是否保存K线到数据库
-        'save_tick_csv': True,            # 是否保存TICK到CSV文件
-        'save_tick_db': True,            # 是否保存TICK到数据库
+        'save_tick_csv': False,            # 是否保存TICK到CSV文件
+        'save_tick_db': False,            # 是否保存TICK到数据库
         'data_save_path': './live_data',  # CSV文件保存路径
         'db_path': 'data_cache/backtest_data.db',  # 数据库路径
     },
@@ -144,12 +138,15 @@ ACCOUNTS = {
         # 'history_symbol': 'rb888',      # 自定义历史数据源 (默认自动推导为主力XXX888)
                                          # 跨期套利时可指定: 主力用'rb888', 次主力用'rb777'
         
+        # K线数据源配置
+        # 'kline_source': 'local',        # K线数据源: 'local'(默认,CTP本地聚合) 或 'data_server'(远程推送)
+        
         # 回调配置
         'enable_tick_callback': False,     # 是否启用TICK回调 (实时行情推送)
         
         # 数据保存配置 (默认全部关闭)
         'save_kline_csv': False,          # 是否保存K线到CSV文件
-        'save_kline_db': False,           # 是否保存K线到数据库
+        'save_kline_db': True,           # 是否保存K线到数据库
         'save_tick_csv': False,           # 是否保存TICK到CSV文件
         'save_tick_db': False,            # 是否保存TICK到数据库
         'data_save_path': './live_data',  # CSV文件保存路径
@@ -180,19 +177,33 @@ def get_config(mode: RunMode, account: str = None, auto_params: bool = True, **o
                        - 不指定: 自动推导为主力连续(XXX888)
                        - 'rb888': 主力连续
                        - 'rb777': 次主力连续
+        
+        数据请求参数（回测模式，三选一可组合）:
+        start_date: 开始日期 'YYYY-MM-DD'
+        end_date: 结束日期 'YYYY-MM-DD'
+        start_time: 精确开始时间 'YYYY-MM-DD HH:MM:SS'
+        end_time: 精确结束时间 'YYYY-MM-DD HH:MM:SS'
+        limit: BAR线数量，获取最近N根K线
     
     示例:
-        # 回测 - 自动获取 au 合约参数
-        config = get_config(RunMode.BACKTEST, symbol='au888', start_date='2025-01-01')
-        # 自动设置: contract_multiplier=1000, price_tick=0.02, margin_rate=0.08
+        # 回测 - 日期范围
+        config = get_config(RunMode.BACKTEST, symbol='au888', 
+                           start_date='2025-01-01', end_date='2025-12-31')
+        
+        # 回测 - 精确时间范围
+        config = get_config(RunMode.BACKTEST, symbol='au888', kline_period='1m',
+                           start_time='2026-02-10 09:00:00', end_time='2026-02-14 15:00:00')
+        
+        # 回测 - 最近N根K线
+        config = get_config(RunMode.BACKTEST, symbol='au888', kline_period='1m',
+                           limit=1000)
+        
+        # 回测 - 从某日开始取N根
+        config = get_config(RunMode.BACKTEST, symbol='au888', kline_period='5m',
+                           start_date='2026-01-01', limit=500)
         
         # SIMNOW - 自动获取参数
         config = get_config(RunMode.SIMNOW, account='simnow_default', symbol='au2602')
-        
-        # 手动指定参数（覆盖自动获取）
-        config = get_config(RunMode.BACKTEST, symbol='au888', 
-                           price_tick=0.05,  # 手动覆盖
-                           start_date='2025-01-01')
         
         # 禁用自动参数
         config = get_config(RunMode.BACKTEST, auto_params=False, symbol='au888', ...)
@@ -211,6 +222,16 @@ def get_config(mode: RunMode, account: str = None, auto_params: bool = True, **o
     
     # 应用用户覆盖参数
     config.update(overrides)
+    
+    # 如果启用了 data_server K线模式，自动填充连接配置
+    if config.get('kline_source') == 'data_server':
+        from ._server_config import DATA_SERVER as _DS
+        if 'data_server' not in config:
+            config['data_server'] = _DS.copy()
+        else:
+            merged_ds = _DS.copy()
+            merged_ds.update(config['data_server'])
+            config['data_server'] = merged_ds
     
     # 自动获取合约参数
     if auto_params:

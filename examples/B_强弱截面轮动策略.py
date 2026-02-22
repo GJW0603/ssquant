@@ -11,6 +11,9 @@
 3. 选择动量最弱的品种做空
 4. 定期调仓
 """
+from pickle import FALSE
+
+from sqlalchemy import true
 from ssquant.api.strategy_api import StrategyAPI
 from ssquant.backtest.unified_runner import UnifiedStrategyRunner, RunMode
 import pandas as pd
@@ -366,7 +369,7 @@ if __name__ == "__main__":
         config = get_config(RUN_MODE,
             # -------- 基础配置 --------
             start_date='2025-12-01',          # 回测开始日期
-            end_date='2026-01-31',            # 回测结束日期
+            end_date='2026-02-31',            # 回测结束日期
             initial_capital=100000,           # 初始资金 (元)
             # commission=自动,                # 手续费率（自动从远程获取）
             # margin_rate=自动,               # 保证金率（自动从远程获取）
@@ -391,7 +394,7 @@ if __name__ == "__main__":
                 },
                 {   # 数据源1: 热卷主力连续
                     'symbol': 'hc888',        # 合约代码
-                    'kline_period': '1m',     # K线周期
+                    'kline_period': '3m',     # K线周期
                     'adjust_type': '1',       # 复权类型
                     # 'price_tick': 自动,     # 最小变动价位（自动获取）
                     # 'contract_multiplier': 自动,  # 合约乘数（自动获取）
@@ -407,7 +410,7 @@ if __name__ == "__main__":
                 },
                 {   # 数据源3: 焦炭主力连续
                     'symbol': 'j888',         # 合约代码
-                    'kline_period': '1m',     # K线周期
+                    'kline_period': '5m',     # K线周期
                     'adjust_type': '1',       # 复权类型
                     # 'price_tick': 自动,     # 最小变动价位（自动获取）
                     # 'contract_multiplier': 自动,  # 合约乘数（自动获取）
@@ -422,6 +425,11 @@ if __name__ == "__main__":
             # -------- 账户配置 --------
             account='simnow_default',         # 账户名称
             server_name='电信1',              # 服务器: 电信1/电信2/移动/TEST(盘后测试)
+            
+            # -------- K线数据源（可选）--------
+            # 默认 'local': 本地 CTP Tick 实时聚合K线
+            # 切换 'data_server': K线由 data_server WebSocket 推送（需 data_server 运行中）
+            #kline_source='data_server', #取消注释即可使用data_server推送的K线
             
             # -------- 多品种配置 --------
             # 注：price_tick 自动获取，如需手动指定请取消注释
@@ -506,6 +514,11 @@ if __name__ == "__main__":
         config = get_config(RUN_MODE,
             # -------- 账户配置 --------
             account='real_default',           # 账户名称 (对应trading_config.py中的配置)
+            
+            # -------- K线数据源（可选）--------
+            # 默认 'local': 本地 CTP Tick 实时聚合K线
+            # 切换 'data_server': K线由 data_server WebSocket 推送（需 data_server 运行中）
+            #kline_source='data_server', #取消注释即可使用data_server推送的K线
             
             # -------- 多品种配置 --------
             # 注：price_tick 自动获取，如需手动指定请取消注释

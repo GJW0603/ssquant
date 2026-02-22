@@ -23,14 +23,34 @@ class RealTradingMdSpi(MdSpi):
         self.client = client
     
     def OnFrontConnected(self):
-        """行情前置连接"""
-        print("[行情] 已连接到服务器")
+        """行情前置连接（首次连接或断线重连）"""
+        # 判断是否是重连
+        was_disconnected = hasattr(self, '_was_connected') and self._was_connected
+        self._was_connected = True
+        
+        if was_disconnected:
+            print("[行情] ✅ 服务器重连成功！正在重新登录...")
+        else:
+            print("[行情] 已连接到服务器")
+        
         # 登录
         self.client.md_api.login(
             self.client.broker_id,
             self.client.investor_id,
             self.client.password
         )
+    
+    def OnFrontDisconnected(self, nReason: int):
+        """行情连接断开 - CTP会自动重连"""
+        reason_map = {
+            0x1001: '网络读取失败',
+            0x1002: '网络写入失败', 
+            0x2001: '接收心跳超时',
+            0x2002: '发送心跳超时',
+            0x2003: '收到错误报文',
+        }
+        reason_desc = reason_map.get(nReason, '未知原因')
+        print(f"[行情] ⚠️ 服务器断开: {reason_desc}，CTP会自动重连...")
     
     def OnRspUserLogin(self, pRspUserLogin, pRspInfo, nRequestID, bIsLast):
         """行情登录响应"""
@@ -127,8 +147,18 @@ class RealTradingTraderSpi(TraderSpi):
         return str(self.order_ref)
     
     def OnFrontConnected(self):
-        """交易前置连接"""
-        print("[交易] 已连接到服务器")
+        """交易前置连接（首次连接或断线重连）"""
+        # 判断是否是重连
+        was_disconnected = hasattr(self, '_was_connected') and self._was_connected
+        self._was_connected = True
+        
+        if was_disconnected:
+            print(f"\n{'='*60}")
+            print("[交易] ✅ 服务器重连成功！正在重新认证...")
+            print(f"{'='*60}\n")
+        else:
+            print("[交易] 已连接到服务器")
+        
         # 产品认证
         self.client.trader_api.authenticate(
             self.client.broker_id,
@@ -137,14 +167,39 @@ class RealTradingTraderSpi(TraderSpi):
             self.client.auth_code
         )
     
+    def OnFrontDisconnected(self, nReason: int):
+        """交易连接断开 - CTP会自动重连"""
+        reason_map = {
+            0x1001: '网络读取失败',
+            0x1002: '网络写入失败', 
+            0x2001: '接收心跳超时',
+            0x2002: '发送心跳超时',
+            0x2003: '收到错误报文',
+        }
+        reason_desc = reason_map.get(nReason, '未知原因')
+        print(f"\n{'!'*60}")
+        print(f"[交易] ⚠️ 服务器断开连接！")
+        print(f"[交易] 原因码: {nReason:#x} ({nReason}) - {reason_desc}")
+        print(f"[交易] 🔄 CTP会自动重连，请等待...")
+        print(f"{'!'*60}\n")
+    
     def OnRspAuthenticate(self, pRspAuthenticateField, pRspInfo, nRequestID, bIsLast):
         """认证响应"""
         if pRspInfo and pRspInfo.ErrorID != 0:
             error_msg = self._decode_error_msg(pRspInfo.ErrorMsg)
             full_msg = self.client._get_error_desc(pRspInfo.ErrorID, error_msg)
             print(f"[交易] 认证失败: {full_msg}")
+            
+            # 认证失败后持续重试（服务器可能还未完全就绪，如收盘后CTP自动重连）
+            retry_count = getattr(self, '_auth_retry_count', 0)
+            self._auth_retry_count = retry_count + 1
+            delay = min(3 * (retry_count + 1), 30)  # 3s, 6s, 9s, ... 最长30s
+            print(f"[交易] {delay}秒后重试认证 (第{self._auth_retry_count}次)...")
+            import threading
+            threading.Timer(delay, self._retry_authenticate).start()
             return
         
+        self._auth_retry_count = 0  # 认证成功，重置计数器
         print("[交易] 认证成功")
         
         # 登录
@@ -153,6 +208,23 @@ class RealTradingTraderSpi(TraderSpi):
             self.client.investor_id,
             self.client.password
         )
+    
+    def _retry_authenticate(self):
+        """重试交易认证"""
+        if not (hasattr(self, '_was_connected') and self._was_connected):
+            print("[交易] 连接已断开，取消认证重试")
+            return
+        
+        print("[交易] 正在重试认证...")
+        try:
+            self.client.trader_api.authenticate(
+                self.client.broker_id,
+                self.client.investor_id,
+                self.client.app_id,
+                self.client.auth_code
+            )
+        except Exception as e:
+            print(f"[交易] 重试认证异常: {e}")
     
     def OnRspUserLogin(self, pRspUserLogin, pRspInfo, nRequestID, bIsLast):
         """交易登录响应"""
@@ -694,6 +766,16 @@ class RealTradingClient:
     def _send_order(self, instrument_id: str, direction: str, offset_flag: str,
                     price: float, volume: int) -> str:
         """发送报单"""
+        # 【关键修复】发送订单前检查连接状态
+        if not self.is_ready():
+            print(f"❌ [下单失败] CTP客户端未就绪！")
+            print(f"   - 行情连接: {'已连接' if self.md_spi.connected else '已断开'}")
+            print(f"   - 行情登录: {'已登录' if self.md_spi.logged_in else '未登录'}")
+            print(f"   - 交易连接: {'已连接' if self.trader_spi.connected else '已断开'}")
+            print(f"   - 交易登录: {'已登录' if self.trader_spi.logged_in else '未登录'}")
+            print(f"   - 合约: {instrument_id}, 价格: {price}, 数量: {volume}")
+            return None
+        
         order_ref = self.trader_spi.get_next_order_ref()
         self.trader_api.order_insert(
             broker_id=self.broker_id,
@@ -707,8 +789,18 @@ class RealTradingClient:
         )
         return order_ref
     
-    def cancel_order(self, instrument_id: str, order_sys_id: str, exchange_id: str = "SHFE"):
-        """撤单"""
+    def cancel_order(self, instrument_id: str, order_sys_id: str, exchange_id: str = ""):
+        """
+        撤单
+        :param instrument_id: 合约代码
+        :param order_sys_id: 交易所报单编号
+        :param exchange_id: 交易所代码（不传则根据合约自动推导）
+        """
+        # 如果未指定交易所代码，自动推导
+        if not exchange_id:
+            from .trader_api import _get_exchange_id
+            exchange_id = _get_exchange_id(instrument_id) or 'SHFE'
+        
         order_ref = self.trader_spi.get_next_order_ref()
         self.trader_api.order_action(
             broker_id=self.broker_id,

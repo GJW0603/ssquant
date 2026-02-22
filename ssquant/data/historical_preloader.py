@@ -78,258 +78,294 @@ class HistoricalDataPreloader:
         print(f"表名: {table_name}")
         print(f"加载K线数: {lookback_bars} 根")
         
-        # 3. 检查数据库是否存在
+        # 3. K线数据：从 data_server 获取（服务端完成 1M→目标周期聚合）
+        #    （TICK 数据仍走本地数据库，因为 data_server 不提供 TICK）
+        if period.lower() != 'tick':
+            print(f"→ 从 data_server 获取 {period.upper()} 数据...")
+            df = self._fetch_from_data_server(continuous_symbol, period, lookback_bars, adjust_type)
+            if not df.empty:
+                print(f"✅ 预加载完成: {len(df)} 条 {period.upper()} K线")
+                print(f"数据范围: {df.index[0]} 至 {df.index[-1]}")
+                print(f"{'='*60}\n")
+                return df
+            
+            # data_server 不可用时，回退到本地数据库
+            print(f"⚠️ data_server 获取失败，尝试本地数据库回退...")
+            df = self._fallback_local_db(continuous_symbol, period, lookback_bars, 
+                                         adjust_type, table_name)
+            if not df.empty:
+                print(f"{'='*60}\n")
+                return df
+            
+            print(f"❌ 无法获取数据: {continuous_symbol} {period}")
+            print(f"{'='*60}\n")
+            return pd.DataFrame()
+        
+        # 4. TICK 数据：从本地数据库读取（data_server 不提供 TICK）
         if not os.path.exists(self.db_path):
             print(f"⚠️ 本地数据库不存在: {self.db_path}")
-            
-            # 检查是否启用云端数据
-            if self._is_cloud_enabled():
-                print(f"→ 尝试从云服务器获取数据...")
-                
-                # 尝试从云服务器获取数据
-                df = self._fetch_from_cloud(continuous_symbol, period, lookback_bars, adjust_type)
-                if not df.empty:
-                    print(f"✅ 云端获取成功，已缓存到本地")
-                    print(f"{'='*60}\n")
-                    return df
-                else:
-                    print(f"❌ 云端也没有数据: {continuous_symbol}")
-                    print(f"{'='*60}\n")
-                    return pd.DataFrame()
-            else:
-                print(f"⚠️ 云端数据已关闭 (ENABLE_CLOUD_DATA=False)")
-                print(f"{'='*60}\n")
-                return pd.DataFrame()
+            print(f"{'='*60}\n")
+            return pd.DataFrame()
         
-        # 4. 从数据库读取最近N根K线
         try:
             conn = sqlite3.connect(self.db_path, timeout=30)
             cursor = conn.cursor()
-            cursor.execute("PRAGMA journal_mode=WAL")  # WAL模式：支持并发读写
+            cursor.execute("PRAGMA journal_mode=WAL")
             
-            # 检查表是否存在（兼容大小写）
-            # 尝试原始表名、小写周期、大写周期
-            possible_names = [
-                table_name,  # 原始表名
-                f"{continuous_symbol}_{period.lower()}_{table_suffix}",  # 小写周期
-                f"{continuous_symbol}_{period.upper()}_{table_suffix}",  # 大写周期
-            ]
-            
-            actual_table_name = None
-            for name in possible_names:
-                cursor.execute(f"SELECT name FROM sqlite_master WHERE type='table' AND name='{name}'")
-                if cursor.fetchone() is not None:
-                    actual_table_name = name
-                    break
-            
-            table_exists = actual_table_name is not None
-            if table_exists:
-                table_name = actual_table_name  # 使用实际存在的表名
-            
-            if not table_exists:
-                print(f"⚠️ 本地表不存在: {table_name}")
+            cursor.execute(f"SELECT name FROM sqlite_master WHERE type='table' AND name='{table_name}'")
+            if cursor.fetchone() is None:
+                print(f"⚠️ TICK表不存在: {table_name}")
                 conn.close()
-                
-                # 检查是否启用云端数据
-                if self._is_cloud_enabled():
-                    print(f"→ 尝试从云服务器获取数据...")
-                    
-                    # 尝试从云服务器获取数据
-                    df = self._fetch_from_cloud(continuous_symbol, period, lookback_bars, adjust_type)
-                    if not df.empty:
-                        print(f"✅ 云端获取成功，已缓存到本地")
-                        print(f"{'='*60}\n")
-                        return df
-                    else:
-                        print(f"❌ 云端也没有数据: {continuous_symbol}")
-                        print(f"{'='*60}\n")
-                        return pd.DataFrame()
-                else:
-                    print(f"⚠️ 云端数据已关闭 (ENABLE_CLOUD_DATA=False)")
-                    print(f"{'='*60}\n")
-                    return pd.DataFrame()
+                print(f"{'='*60}\n")
+                return pd.DataFrame()
             
-            # 读取最近N根K线（先按时间倒序取N条，然后再正序排列）
             query = f"""
                 SELECT * FROM (
-                    SELECT * FROM {table_name}
+                    SELECT * FROM "{table_name}"
                     ORDER BY datetime DESC
                     LIMIT ?
                 ) sub
                 ORDER BY datetime ASC
             """
-            
-            df = pd.read_sql_query(
-                query, 
-                conn, 
-                params=(lookback_bars,)
-            )
-            
+            df = pd.read_sql_query(query, conn, params=(lookback_bars,))
             conn.close()
             
             if not df.empty:
-                # 转换datetime列
-                df['datetime'] = pd.to_datetime(df['datetime'])
-                
-                # 设置索引
+                df['datetime'] = pd.to_datetime(df['datetime'], format='mixed')
                 df = df.set_index('datetime')
-                
-                print(f"✅ 本地加载 {len(df)} 条历史数据")
+                print(f"✅ 本地加载 {len(df)} 条TICK数据")
                 print(f"数据范围: {df.index[0]} 至 {df.index[-1]}")
-                
-                # 检查数据是否过期（最新数据不是今天）
-                latest_date = df.index[-1].date()
-                today = datetime.now().date()
-                
-                if latest_date < today and self._is_cloud_enabled():
-                    print(f"⚠️ 本地数据已过期（最新: {latest_date}，今天: {today}）")
-                    print(f"→ 尝试从云端获取最新数据...")
-                    
-                    # 从云端获取更新的数据
-                    cloud_df = self._fetch_from_cloud(continuous_symbol, period, lookback_bars, adjust_type)
-                    
-                    if not cloud_df.empty:
-                        cloud_latest = cloud_df.index[-1].date()
-                        if cloud_latest > latest_date:
-                            print(f"✅ 云端数据更新（最新: {cloud_latest}）")
-                            print(f"{'='*60}\n")
-                            return cloud_df
-                        else:
-                            print(f"→ 云端数据无更新，使用本地数据")
-                    else:
-                        print(f"→ 云端获取失败，使用本地数据")
-                
             else:
-                print(f"⚠️  表 {table_name} 存在但无数据")
-                print(f"可能原因：请求的日期范围内没有数据")
+                print(f"⚠️ TICK表无数据: {table_name}")
             
             print(f"{'='*60}\n")
             return df
             
         except Exception as e:
-            print(f"❌ 预加载失败: {e}")
+            print(f"❌ 预加载TICK失败: {e}")
             print(f"{'='*60}\n")
             import traceback
             traceback.print_exc()
             return pd.DataFrame()
     
-    def _is_cloud_enabled(self) -> bool:
-        """检查是否启用云端数据获取"""
-        try:
-            from ..config.trading_config import ENABLE_CLOUD_DATA
-            return ENABLE_CLOUD_DATA
-        except ImportError:
-            # 如果配置不存在，默认启用
-            return True
-    
-    def _fetch_from_cloud(self, symbol: str, period: str, 
-                          lookback_bars: int, adjust_type: str) -> pd.DataFrame:
+    def _fallback_local_db(self, continuous_symbol: str, period: str,
+                           lookback_bars: int, adjust_type: str,
+                           table_name: str) -> pd.DataFrame:
         """
-        从云服务器获取数据并缓存到本地
+        data_server 不可用时，回退到本地数据库。
+        优先从 1M 表聚合，其次尝试目标周期表。
+        """
+        if not os.path.exists(self.db_path):
+            print(f"→ 本地数据库不存在: {self.db_path}")
+            return pd.DataFrame()
         
-        Args:
-            symbol: 连续合约符号，如 tl888
-            period: K线周期，如 1m, 5m
-            lookback_bars: 需要的K线数量
-            adjust_type: 复权类型
-            
-        Returns:
-            历史K线DataFrame
-        """
         try:
-            # 获取API凭据
-            from ..config.trading_config import get_api_auth
-            username, password = get_api_auth()
+            table_suffix = 'hfq' if adjust_type == '1' else 'raw'
+            conn = sqlite3.connect(self.db_path, timeout=30)
+            cursor = conn.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
             
-            if not username or not password:
-                print(f"⚠️ 未配置API账号，请在 ssquant/config/trading_config.py 中设置")
+            # 非 1M 周期：优先从 1M 表聚合
+            is_non_1m = period.lower() not in ('1m', '1min', 'tick')
+            if is_non_1m:
+                df = self._try_load_from_1m(cursor, conn, continuous_symbol,
+                                            period, lookback_bars, table_suffix)
+                if df is not None and not df.empty:
+                    conn.close()
+                    print(f"✅ 本地回退: 1M→{period.upper()} 聚合 {len(df)} 条")
+                    print(f"数据范围: {df.index[0]} 至 {df.index[-1]}")
+                    return df
+            
+            # 尝试目标周期表
+            possible_names = [
+                table_name,
+                f"{continuous_symbol}_{period.lower()}_{table_suffix}",
+                f"{continuous_symbol}_{period.upper()}_{table_suffix}",
+            ]
+            actual_table = None
+            for name in possible_names:
+                cursor.execute(f"SELECT name FROM sqlite_master WHERE type='table' AND name='{name}'")
+                if cursor.fetchone() is not None:
+                    actual_table = name
+                    break
+            
+            if actual_table is None:
+                conn.close()
+                print(f"→ 本地无可用表")
                 return pd.DataFrame()
             
-            # 计算日期范围（往前推足够天数以获取足够K线）
-            end_date = datetime.now().strftime('%Y-%m-%d')
+            query = f"""
+                SELECT * FROM (
+                    SELECT * FROM "{actual_table}"
+                    ORDER BY datetime DESC
+                    LIMIT ?
+                ) sub
+                ORDER BY datetime ASC
+            """
+            df = pd.read_sql_query(query, conn, params=(lookback_bars,))
+            conn.close()
             
-            # 根据周期估算需要的天数
-            period_lower = period.lower()
-            if period_lower in ['1m', '1M']:
-                # 1分钟K线，一天约240根，100根约0.5天，多取30天
-                days_back = max(30, lookback_bars // 240 + 10)
-            elif period_lower in ['5m', '5M']:
-                # 5分钟K线，一天约48根，100根约2天，多取30天
-                days_back = max(30, lookback_bars // 48 + 10)
-            elif period_lower in ['15m', '15M']:
-                # 15分钟K线，一天约16根，100根约7天，多取30天
-                days_back = max(30, lookback_bars // 16 + 10)
-            elif period_lower in ['30m', '30M']:
-                days_back = max(30, lookback_bars // 8 + 10)
-            elif period_lower in ['1h', '60m', '1H', '60M']:
-                days_back = max(60, lookback_bars // 4 + 10)
-            elif period_lower in ['1d', '1D', 'd', 'D']:
-                days_back = max(365, lookback_bars + 30)
-            else:
-                days_back = 60  # 默认60天
+            if not df.empty:
+                df['datetime'] = pd.to_datetime(df['datetime'])
+                df = df.set_index('datetime')
+                print(f"✅ 本地回退: 从 {actual_table} 加载 {len(df)} 条")
+                print(f"数据范围: {df.index[0]} 至 {df.index[-1]}")
             
-            start_date = (datetime.now() - timedelta(days=days_back)).strftime('%Y-%m-%d')
-            
-            # 转换周期格式（ssquant API 使用 1M, 5M 等格式）
-            period_map = {
-                '1m': '1M', '5m': '5M', '15m': '15M', '30m': '30M',
-                '1h': '1H', '60m': '1H', '1d': '1D', 'd': '1D'
-            }
-            api_period = period_map.get(period_lower, period.upper())
-            
-            print(f"→ 请求云端数据: {symbol} {api_period} ({start_date} ~ {end_date})")
-            
-            # 调用API获取数据
-            from .api_data_fetcher import get_futures_data
-            
-            data = get_futures_data(
-                symbol=symbol,
-                start_date=start_date,
-                end_date=end_date,
-                username=username,
-                password=password,
-                kline_period=api_period,
-                adjust_type=adjust_type,
-                use_cache=True,  # 自动缓存到本地
-                save_data=True
-            )
-            
-            if data is None or data.empty:
-                return pd.DataFrame()
-            
-            # 统一datetime字段并排序，避免范围显示与实际返回不一致
-            if not isinstance(data.index, pd.DatetimeIndex):
-                if 'datetime' in data.columns:
-                    data['datetime'] = pd.to_datetime(data['datetime'])
-                    data = data.sort_values('datetime')
-                else:
-                    return pd.DataFrame()
-            else:
-                data = data.sort_index()
-
-            # 打印云端数据的实际范围（调试用）
-            if isinstance(data.index, pd.DatetimeIndex):
-                print(f"→ 云端数据实际范围: {data.index.min()} 至 {data.index.max()} (共 {len(data)} 条)")
-            else:
-                temp_dt = pd.to_datetime(data['datetime'])
-                print(f"→ 云端数据实际范围: {temp_dt.min()} 至 {temp_dt.max()} (共 {len(data)} 条)")
-            
-            # 取最近N根K线
-            if len(data) > lookback_bars:
-                data = data.tail(lookback_bars)
-            
-            # 确保索引是datetime类型
-            if not isinstance(data.index, pd.DatetimeIndex):
-                data['datetime'] = pd.to_datetime(data['datetime'])
-                data = data.set_index('datetime')
-            
-            return data
+            return df
             
         except Exception as e:
-            print(f"❌ 云端获取失败: {e}")
-            import traceback
-            traceback.print_exc()
+            print(f"→ 本地回退失败: {e}")
             return pd.DataFrame()
+
+    @staticmethod
+    def _estimate_1m_bars(target_period: str, target_bars: int) -> int:
+        """
+        估算需要多少根 1M K线才能聚合出 target_bars 根目标周期K线。
+        加 20% 安全余量以应对夜盘/休市间隔。
+        """
+        import re as _re
+        p = target_period.strip().lower()
+        
+        m = _re.match(r'^(\d+)(m|min)$', p)
+        if m:
+            ratio = int(m.group(1))
+            return int(target_bars * ratio * 1.2) + 50
+        
+        m = _re.match(r'^(\d+)(h|hour)$', p)
+        if m:
+            ratio = int(m.group(1)) * 60
+            return int(target_bars * ratio * 1.2) + 50
+        
+        if p in ('1d', 'd', 'day'):
+            # 期货一天约 240~300 根 1M（含夜盘）
+            return int(target_bars * 300 * 1.2) + 50
+        
+        # 未知周期，给大一点
+        return target_bars * 60
+
+    def _try_load_from_1m(self, cursor, conn, continuous_symbol: str,
+                          target_period: str, lookback_bars: int,
+                          table_suffix: str):
+        """
+        尝试从本地 1M 表读取数据并聚合为目标周期。
+        
+        Returns:
+            聚合后的 DataFrame（datetime 索引），如果 1M 表不存在则返回 None。
+        """
+        # 查找 1M 表
+        possible_1m_names = [
+            f"{continuous_symbol}_1M_{table_suffix}",
+            f"{continuous_symbol}_1m_{table_suffix}",
+        ]
+        
+        actual_1m_table = None
+        for name in possible_1m_names:
+            cursor.execute(f"SELECT name FROM sqlite_master WHERE type='table' AND name='{name}'")
+            if cursor.fetchone() is not None:
+                actual_1m_table = name
+                break
+        
+        if actual_1m_table is None:
+            print(f"→ 本地 1M 表不存在，无法本地聚合")
+            return None
+        
+        # 估算需要多少根 1M 数据
+        need_1m_bars = self._estimate_1m_bars(target_period, lookback_bars)
+        
+        print(f"→ 从本地 1M 表聚合: 读取 ~{need_1m_bars} 根 1M → {target_period.upper()}")
+        
+        query = f"""
+            SELECT * FROM (
+                SELECT * FROM "{actual_1m_table}"
+                ORDER BY datetime DESC
+                LIMIT ?
+            ) sub
+            ORDER BY datetime ASC
+        """
+        
+        df_1m = pd.read_sql_query(query, conn, params=(need_1m_bars,))
+        
+        if df_1m.empty:
+            return None
+        
+        df_1m['datetime'] = pd.to_datetime(df_1m['datetime'])
+        df_1m = df_1m.set_index('datetime')
+        
+        # 本地聚合
+        from .multi_period import aggregate_1m_to_period
+        df_agg = aggregate_1m_to_period(df_1m, target_period)
+        
+        if df_agg is None or df_agg.empty:
+            return None
+        
+        # 截取最近 lookback_bars 根
+        if len(df_agg) > lookback_bars:
+            df_agg = df_agg.iloc[-lookback_bars:]
+        
+        return df_agg
+    
+    def _fetch_from_data_server(self, symbol: str, period: str,
+                                lookback_bars: int, adjust_type: str) -> pd.DataFrame:
+        """
+        从 data_server REST API 获取数据（鉴权通过后优先使用）
+        
+        使用 /api/futures/history?limit=N 按数量获取最近N条，不受日期范围限制。
+        data_server 服务端完成 1M → 目标周期的聚合，客户端直接请求目标周期。
+        复权由本地 apply_local_adjust() 完成。
+        """
+        try:
+            import requests
+            from ..config._server_config import DATA_SERVER
+            api_url = DATA_SERVER.get('api_url', '')
+            
+            if not api_url:
+                return pd.DataFrame()
+            
+            normalized = period.strip().upper()
+            
+            url = f"{api_url.rstrip('/')}/api/futures/history"
+            params = {
+                'symbol': symbol.lower(),
+                'period': normalized,
+                'limit': lookback_bars,
+                'adjust_type': '0',
+            }
+            
+            resp = requests.get(url, params=params, timeout=(5, 30))
+            if resp.status_code != 200:
+                return pd.DataFrame()
+            
+            result = resp.json()
+            if result.get('code') != 0:
+                return pd.DataFrame()
+            
+            data_obj = result.get('data', {})
+            records = data_obj.get('klines', []) if isinstance(data_obj, dict) else data_obj
+            
+            if not records:
+                return pd.DataFrame()
+            
+            df = pd.DataFrame(records)
+            
+            if df.empty or 'datetime' not in df.columns:
+                return pd.DataFrame()
+            
+            df['datetime'] = pd.to_datetime(df['datetime'])
+            df = df.set_index('datetime')
+            
+            print(f"[data_server API] 获取 {normalized} 数据: {symbol} x {len(df)} 条")
+            print(f"  数据范围: {df.index[0]} ~ {df.index[-1]}")
+            
+            # 本地复权（当前为占位直通，后续实现算法后自动生效）
+            if adjust_type != '0':
+                from .local_adjust import apply_local_adjust
+                df = apply_local_adjust(df, symbol, period, adjust_type)
+            
+            return df
+            
+        except Exception:
+            return pd.DataFrame()
+    
     
     def preload_tick(self, specific_contract: str, 
                      lookback_count: int = 1000,

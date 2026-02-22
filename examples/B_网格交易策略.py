@@ -193,6 +193,11 @@ if __name__ == "__main__":
             account='simnow_default',         # 账户名称（在trading_config.py的ACCOUNTS中定义）
             server_name='电信1',              # 服务器: 电信1/电信2/移动/TEST(盘后测试)
             
+            # -------- K线数据源（可选）--------
+            # 默认 'local': 本地 CTP Tick 实时聚合K线
+            # 切换 'data_server': K线由 data_server WebSocket 推送（需 data_server 运行中）
+            #kline_source='data_server', #取消注释即可使用data_server推送的K线
+            
             # -------- 合约配置 --------
             symbol='rb2601',                  # 交易合约代码（具体月份合约）
             kline_period='1m',                # K线周期
@@ -232,6 +237,11 @@ if __name__ == "__main__":
             account='real_default',           # 账户名称（在trading_config.py的ACCOUNTS中定义）
             # 实盘账户需要配置: broker_id, investor_id, password,
             #                  md_server, td_server, app_id, auth_code
+            
+            # -------- K线数据源（可选）--------
+            # 默认 'local': 本地 CTP Tick 实时聚合K线
+            # 切换 'data_server': K线由 data_server WebSocket 推送（需 data_server 运行中）
+            #kline_source='data_server', #取消注释即可使用data_server推送的K线
             
             # -------- 合约配置 --------
             symbol='rb2601',                  # 交易合约代码

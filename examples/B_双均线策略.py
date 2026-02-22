@@ -152,7 +152,7 @@ if __name__ == "__main__":
     from ssquant.config.trading_config import get_config
     
     # ========== 运行模式 ==========
-    RUN_MODE = RunMode.BACKTEST  # 可选: BACKTEST, SIMNOW, REAL_TRADING
+    RUN_MODE = RunMode.SIMNOW  # 可选: BACKTEST, SIMNOW, REAL_TRADING
     
     # ========== 策略参数 ==========
     strategy_params = {'fast_ma': 5, 'slow_ma': 20}
@@ -160,13 +160,28 @@ if __name__ == "__main__":
     # ========== 配置 ==========
     if RUN_MODE == RunMode.BACKTEST:
         # ==================== 回测配置 ====================
+        # 数据请求支持三种方式:
+        #   方式A: 日期范围 (start_date + end_date)
+        #   方式B: 精确时间 (start_time + end_time)  — 可精确到秒
+        #   方式C: BAR线数量 (limit)                  — 获取最近N根K线
+        #   可组合: start_date + limit, start_time + limit 等
         config = get_config(RUN_MODE,
             # -------- 基础配置 --------
-            symbol='y888',                   # 合约代码 (连续合约用888后缀)
-            start_date='2025-12-01',          # 回测开始日期
-            end_date='2026-01-31',            # 回测结束日期
-            kline_period='1m',                # K线周期: '1m','5m','15m','30m','1h','4h','1d'
+            symbol='j888',                   # 合约代码 (连续合约用888后缀)
+            kline_period='5M',                # K线周期: '1m','5m','15m','30m','1h','4h','1d'
             adjust_type='1',                  # 复权类型: '0'不复权, '1'后复权
+            
+            # -------- 数据请求方式（三选一，可组合）--------
+            # 方式A: 日期范围
+            start_date='2025-11-28',          # 回测开始日期 (YYYY-MM-DD)
+            end_date='2026-02-13 14:05:00',            # 回测结束日期 (YYYY-MM-DD)
+            
+            # 方式B: 精确时间范围（取消注释以使用）
+            # start_time='2026-02-10 09:00:00',  # 精确开始时间 (YYYY-MM-DD HH:MM:SS)
+            # end_time='2026-02-14 15:00:00',    # 精确结束时间
+            
+            # 方式C: BAR线数量（取消注释以使用）
+            # limit=1000,                     # 获取最近1000根K线
             
             # -------- 合约参数（自动获取，无需手动填写）--------
             # price_tick=自动,                # 最小变动价位（自动从远程获取）
@@ -187,11 +202,16 @@ if __name__ == "__main__":
         config = get_config(RUN_MODE,
             # -------- 账户配置 --------
             account='simnow_default',         # 账户名称 (在trading_config.py的ACCOUNTS中定义)
-            server_name='电信1',              # 服务器: '电信1','电信2','移动','TEST'(盘后测试)
+            server_name='TEST',              # 服务器: '电信1','电信2','移动','TEST'(盘后测试)
+            
+            # -------- K线数据源（可选）--------
+            # 默认 'local': 本地 CTP Tick 实时聚合K线
+            # 切换 'data_server': K线由 data_server WebSocket 推送（需 data_server 运行中）
+            kline_source='data_server', #取消注释即可使用data_server推送的K线
             
             # -------- 合约配置 --------
             symbol='au2602',                  # 交易合约代码 (具体月份合约)
-            kline_period='1m',                # K线周期: '1m','5m','15m','30m','1h','1d'
+            kline_period='7m',                # K线周期: '1m','5m','15m','30m','1h','1d'
             
             # -------- 交易参数（price_tick 自动获取）--------
             # price_tick=自动,                # 最小变动价位（自动从远程获取）
@@ -205,7 +225,7 @@ if __name__ == "__main__":
             
             # -------- 历史数据配置 --------
             preload_history=True,             # 是否预加载历史K线 (策略需要历史数据计算指标)
-            history_lookback_bars=100,        # 预加载K线数量 (根据策略指标周期设置)
+            history_lookback_bars=600,        # 预加载K线数量 (根据策略指标周期设置)
             adjust_type='1',                  # 复权类型: '0'不复权, '1'后复权
             # history_symbol='au888',         # 自定义历史数据源 (默认自动推导, 跨期套利时指定)
             
@@ -228,9 +248,15 @@ if __name__ == "__main__":
             # -------- 账户配置 --------
             account='real_default',           # 账户名称 (在trading_config.py的ACCOUNTS中定义)
             
+            # -------- K线数据源（可选）--------
+            # 默认 'local': 本地 CTP Tick 实时聚合K线
+            # 切换 'data_server': K线由 data_server WebSocket 推送（需 data_server 运行中）
+            #kline_source='data_server', #取消注释即可使用data_server推送的K线
+            
             # -------- 合约配置 --------
             symbol='au2602',                  # 交易合约代码
             kline_period='1m',                # K线周期
+            
             
             # -------- 交易参数（price_tick 自动获取）--------
             # price_tick=自动,                # 最小变动价位（自动从远程获取）

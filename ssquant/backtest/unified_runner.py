@@ -83,9 +83,11 @@ class UnifiedStrategyRunner:
                 
                 回测模式必填:
                     - symbol: 合约代码
-                    - start_date: 开始日期
-                    - end_date: 结束日期
                     - kline_period: K线周期
+                    - 以下三种数据请求方式至少选一种:
+                      a) start_date + end_date: 日期范围 (如 '2025-01-01', '2026-01-31')
+                      b) start_time + end_time: 精确时间范围 (如 '2026-02-11 09:00:00')
+                      c) limit: BAR线数量 (如 500，获取最近500根K线)
                     
                 SIMNOW/实盘模式必填:
                     - investor_id: 账号
@@ -120,13 +122,26 @@ class UnifiedStrategyRunner:
     def _validate_config(self):
         """验证配置"""
         if self.mode == RunMode.BACKTEST:
-            # 支持单数据源和多数据源两种配置方式
+            # 支持三种数据请求方式:
+            #   1. 日期范围: start_date + end_date
+            #   2. 精确时间: start_time + end_time
+            #   3. BAR线数量: limit
+            # start_date/end_date 在提供 limit 或 start_time/end_time 时不再强制
+            has_date_range = 'start_date' in self.config and 'end_date' in self.config
+            has_time_range = 'start_time' in self.config or 'end_time' in self.config
+            has_limit = 'limit' in self.config
+            has_data_query = has_date_range or has_time_range or has_limit
+            
             if 'data_sources' in self.config:
                 # 多数据源模式
-                required = ['start_date', 'end_date', 'data_sources']
+                required = ['data_sources']
+                if not has_data_query:
+                    required.extend(['start_date', 'end_date'])
             else:
                 # 单数据源模式
-                required = ['symbol', 'start_date', 'end_date', 'kline_period']
+                required = ['symbol', 'kline_period']
+                if not has_data_query:
+                    required.extend(['start_date', 'end_date'])
             missing = [key for key in required if key not in self.config]
             if missing:
                 raise ValueError(f"回测模式缺少必填参数: {missing}")
@@ -224,6 +239,11 @@ class UnifiedStrategyRunner:
     
     def _run_backtest(self) -> Dict[str, Any]:
         """运行历史回测"""
+        # 鉴权检查
+        from ..data.auth_manager import verify_auth, get_auth_message
+        if not verify_auth():
+            raise RuntimeError(f"鉴权失败: {get_auth_message()}")
+        
         from ..config.trading_config import get_api_auth
         API_USERNAME, API_PASSWORD = get_api_auth()
         
@@ -307,8 +327,12 @@ class UnifiedStrategyRunner:
                     
                     # 保存品种的基础配置（优先使用用户指定 > 自动获取 > 默认值）
                     symbol_config_map[symbol] = {
-                        'start_date': self.config['start_date'],
-                        'end_date': self.config['end_date'],
+                        'start_date': self.config.get('start_date'),
+                        'end_date': self.config.get('end_date'),
+                        # 新增: 精确时间范围和BAR线数量请求
+                        'start_time': self.config.get('start_time'),
+                        'end_time': self.config.get('end_time'),
+                        'limit': self.config.get('limit'),
                         'initial_capital': self.config.get('initial_capital', 100000),
                         'commission': ds_config.get('commission',
                                                     auto_params.get('commission',
@@ -353,8 +377,12 @@ class UnifiedStrategyRunner:
             self.backtester.add_symbol_config(
                 symbol=symbol,
                 config={
-                    'start_date': self.config['start_date'],
-                    'end_date': self.config['end_date'],
+                    'start_date': self.config.get('start_date'),
+                    'end_date': self.config.get('end_date'),
+                    # 新增: 精确时间范围和BAR线数量请求
+                    'start_time': self.config.get('start_time'),
+                    'end_time': self.config.get('end_time'),
+                    'limit': self.config.get('limit'),
                     'initial_capital': self.config.get('initial_capital', 100000),
                     'commission': self.config.get('commission', 0.0001),
                     'margin_rate': self.config.get('margin_rate', 0.1),

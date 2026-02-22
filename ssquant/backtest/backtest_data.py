@@ -58,7 +58,11 @@ class BacktestDataManager:
                 'username': base_config.get('username', ''),
                 'password': base_config.get('password', ''),
                 'use_cache': base_config.get('use_cache', True),
-                'save_data': base_config.get('save_data', True)
+                'save_data': base_config.get('save_data', True),
+                # 新增: 精确时间范围和BAR线数量请求
+                'start_time': config.get('start_time'),
+                'end_time': config.get('end_time'),
+                'limit': config.get('limit'),
             }
             
             # 获取该品种的所有周期数据
@@ -127,7 +131,10 @@ class BacktestDataManager:
                         adjust_type=adjust_type,
                         depth="no",
                         use_cache=data_params['use_cache'],
-                        save_data=data_params['save_data']
+                        save_data=data_params['save_data'],
+                        start_time=data_params.get('start_time'),
+                        end_time=data_params.get('end_time'),
+                        limit=data_params.get('limit'),
                     )
                     
                     if klines is not None and not klines.empty:
