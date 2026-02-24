@@ -1,6 +1,33 @@
+import re
 import pandas as pd
 import numpy as np
 from typing import Dict, List, Any, Optional, Union
+
+
+def _period_to_timedelta(period_str: str) -> pd.Timedelta:
+    """将K线周期字符串转为 pd.Timedelta，支持任意数字前缀。
+    
+    支持格式: 1m/3m/65m/120m, 1h/2h/4h, 1d/2d/d, 1w/2w/w 等
+    """
+    p = period_str.lower().strip()
+    m = re.match(r'^(\d+)(m|min)$', p)
+    if m:
+        return pd.Timedelta(minutes=int(m.group(1)))
+    m = re.match(r'^(\d+)(h|hour)$', p)
+    if m:
+        return pd.Timedelta(hours=int(m.group(1)))
+    m = re.match(r'^(\d+)(d|day)$', p)
+    if m:
+        return pd.Timedelta(days=int(m.group(1)))
+    if p in ('d', 'day'):
+        return pd.Timedelta(days=1)
+    m = re.match(r'^(\d+)(w|week)$', p)
+    if m:
+        return pd.Timedelta(weeks=int(m.group(1)))
+    if p in ('w', 'week'):
+        return pd.Timedelta(weeks=1)
+    print(f"[警告] 无法识别的K线周期 '{period_str}'，默认按1分钟处理")
+    return pd.Timedelta(minutes=1)
 
 
 class DataSource:
@@ -36,6 +63,8 @@ class DataSource:
         self.current_price = None
         self.current_datetime = None
         self.pending_orders = []  # 存储待执行的订单
+        self.original_data = None
+        self._is_higher_tf = False
         
     def set_data(self, data: pd.DataFrame):
         """设置数据"""
@@ -836,6 +865,9 @@ class DataSource:
         回测模式：返回从开始到当前索引的数据（避免未来数据泄露）
         实盘模式：返回所有缓存的数据（deque滚动窗口）
         
+        跨周期场景下，高周期数据源自动返回原始K线（无ffill重复），
+        确保 rolling 等指标在真实K线上计算。
+        
         Args:
             window: 滑动窗口大小，None表示使用配置的lookback_bars，0表示不限制
             
@@ -843,12 +875,21 @@ class DataSource:
             K线数据DataFrame，最多返回window条（从最近往前）
         """
         if not self.data.empty and hasattr(self, 'current_idx'):
+            # 高周期数据源：返回原始K线（无ffill重复）
+            if self._is_higher_tf and self.original_data is not None:
+                current_time = self.data.index[self.current_idx]
+                end = self.original_data.index.searchsorted(current_time, side='right')
+                effective_window = window if window is not None else getattr(self, 'lookback_bars', 0)
+                if effective_window > 0:
+                    start = max(0, end - effective_window)
+                    return self.original_data.iloc[start:end]
+                return self.original_data.iloc[:end]
+
             # 回测模式：只返回到当前索引的数据
             end_idx = self.current_idx + 1
             
             # 确定窗口大小：优先使用传入参数，其次使用配置的lookback_bars
             effective_window = window if window is not None else getattr(self, 'lookback_bars', 0)
-            
             
             # 如果设置了窗口限制（大于0），则只返回最近的window条数据
             if effective_window > 0:
@@ -955,17 +996,30 @@ class MultiDataSource:
         """
         对齐所有数据源的数据
         
+        跨周期防偷价：K线时间戳为周期起始时间（向下取整），高周期K线的 close
+        在周期结束前不应对低周期策略可见。因此在对齐前，将高周期数据源的
+        索引向前偏移一个自身周期，确保数据只在周期结束后才参与 ffill。
+        
         Args:
             align_index: 是否对齐索引
             fill_method: 填充方法，可选值：'ffill', 'bfill', None
         """
         if len(self.data_sources) <= 1:
-            return  # 只有一个或没有数据源，不需要对齐
+            return
             
         # 去除重复索引（数据库可能存在重复行）
         for ds in self.data_sources:
             if not ds.data.empty and ds.data.index.duplicated().any():
                 ds.data = ds.data[~ds.data.index.duplicated(keep='last')]
+        
+        # 跨周期防偷价：高周期索引向前偏移一个周期
+        periods = [_period_to_timedelta(ds.kline_period) for ds in self.data_sources]
+        min_period = min(periods)
+        for i, ds in enumerate(self.data_sources):
+            if periods[i] > min_period and not ds.data.empty:
+                ds.data.index = ds.data.index + periods[i]
+                ds.original_data = ds.data.copy()
+                ds._is_higher_tf = True
         
         # 收集所有数据源的索引
         all_indices = []
@@ -974,9 +1028,9 @@ class MultiDataSource:
                 all_indices.append(ds.data.index)
                 
         if not all_indices:
-            return  # 没有有效的数据源
+            return
             
-        # 找到共同的索引范围
+        # 合并为统一索引
         common_index = all_indices[0]
         for idx in all_indices[1:]:
             common_index = common_index.union(idx)
@@ -984,10 +1038,8 @@ class MultiDataSource:
         # 对齐所有数据源的数据
         for ds in self.data_sources:
             if not ds.data.empty:
-                # 重新索引数据
                 ds.data = ds.data.reindex(common_index)
                 
-                # 填充缺失值
                 if fill_method:
                     if fill_method == 'ffill':
                         ds.data = ds.data.ffill()
