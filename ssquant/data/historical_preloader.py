@@ -32,7 +32,7 @@ class HistoricalDataPreloader:
             specific_contract: 具体合约代码，如 rb2601
             period: K线周期，如 1M, 1H, 1D
             lookback_bars: 回看K线数量，默认100根
-            adjust_type: 复权类型，'0'不复权 '1'后复权
+            adjust_type: 复权类型，'0'不复权 '1'后复权 '2'前复权
             history_symbol: 自定义历史数据符号，如 'rb888' 或 'rb777'
                           如果不指定，则自动推导为主力连续（XXX888）
             
@@ -49,14 +49,14 @@ class HistoricalDataPreloader:
             # 默认推导为主力连续（XXX888）
             continuous_symbol = ContractMapper.get_continuous_symbol(specific_contract)
         
-        # 检查远程后复权开关，保持与 api_data_fetcher.py 一致
+        # 本地复权开关
         try:
             from ..config.trading_config import ENABLE_REMOTE_ADJUST
         except ImportError:
-            ENABLE_REMOTE_ADJUST = False
+            ENABLE_REMOTE_ADJUST = True
         
-        if not ENABLE_REMOTE_ADJUST and adjust_type == '1':
-            print(f"[预加载] 远程服务器升级中暂不支持后复权，adjust_type 已从 '1' 强制改为 '0'")
+        if not ENABLE_REMOTE_ADJUST and adjust_type != '0':
+            print(f"[预加载] 本地复权已禁用，adjust_type 已从 '{adjust_type}' 强制改为 '0'")
             adjust_type = '0'
         
         # 2. 构建表名（周期统一用大写，如 1M, 5M）
@@ -64,7 +64,8 @@ class HistoricalDataPreloader:
         if period.lower() == 'tick':
             table_name = f"{continuous_symbol}_tick"
         else:
-            table_suffix = 'hfq' if adjust_type == '1' else 'raw'
+            from .local_adjust import get_adjust_label, get_adjust_suffix
+            table_suffix = get_adjust_suffix(adjust_type)
             # 周期转大写，与云端数据保存格式一致
             period_upper = period.upper()
             table_name = f"{continuous_symbol}_{period_upper}_{table_suffix}"
@@ -74,7 +75,8 @@ class HistoricalDataPreloader:
         print(f"{'='*60}")
         print(f"具体合约: {specific_contract}")
         print(f"主连符号: {continuous_symbol}")
-        print(f"复权类型: {adjust_type} ({'后复权' if adjust_type == '1' else '不复权'})")
+        from .local_adjust import get_adjust_label
+        print(f"复权类型: {adjust_type} ({get_adjust_label(adjust_type)})")
         print(f"表名: {table_name}")
         print(f"加载K线数: {lookback_bars} 根")
         
@@ -160,7 +162,9 @@ class HistoricalDataPreloader:
             return pd.DataFrame()
         
         try:
-            table_suffix = 'hfq' if adjust_type == '1' else 'raw'
+            from .local_adjust import apply_local_adjust, get_adjust_suffix
+            table_suffix = get_adjust_suffix(adjust_type)
+            need_local_adjust = adjust_type != '0'
             conn = sqlite3.connect(self.db_path, timeout=30)
             cursor = conn.cursor()
             cursor.execute("PRAGMA journal_mode=WAL")
@@ -170,7 +174,14 @@ class HistoricalDataPreloader:
             if is_non_1m:
                 df = self._try_load_from_1m(cursor, conn, continuous_symbol,
                                             period, lookback_bars, table_suffix)
+                used_raw_1m_fallback = False
+                if (df is None or df.empty) and need_local_adjust and table_suffix != 'raw':
+                    df = self._try_load_from_1m(cursor, conn, continuous_symbol,
+                                                period, lookback_bars, 'raw')
+                    used_raw_1m_fallback = df is not None and not df.empty
                 if df is not None and not df.empty:
+                    if used_raw_1m_fallback:
+                        df = apply_local_adjust(df, continuous_symbol, period, adjust_type)
                     conn.close()
                     print(f"✅ 本地回退: 1M→{period.upper()} 聚合 {len(df)} 条")
                     print(f"数据范围: {df.index[0]} 至 {df.index[-1]}")
@@ -182,6 +193,11 @@ class HistoricalDataPreloader:
                 f"{continuous_symbol}_{period.lower()}_{table_suffix}",
                 f"{continuous_symbol}_{period.upper()}_{table_suffix}",
             ]
+            if need_local_adjust and table_suffix != 'raw':
+                possible_names.extend([
+                    f"{continuous_symbol}_{period.lower()}_raw",
+                    f"{continuous_symbol}_{period.upper()}_raw",
+                ])
             actual_table = None
             for name in possible_names:
                 cursor.execute(f"SELECT name FROM sqlite_master WHERE type='table' AND name='{name}'")
@@ -208,6 +224,8 @@ class HistoricalDataPreloader:
             if not df.empty:
                 df['datetime'] = pd.to_datetime(df['datetime'])
                 df = df.set_index('datetime')
+                if need_local_adjust and actual_table.lower().endswith('_raw'):
+                    df = apply_local_adjust(df, continuous_symbol, period, adjust_type)
                 print(f"✅ 本地回退: 从 {actual_table} 加载 {len(df)} 条")
                 print(f"数据范围: {df.index[0]} 至 {df.index[-1]}")
             
@@ -329,19 +347,20 @@ class HistoricalDataPreloader:
                 'period': normalized,
                 'limit': lookback_bars,
                 'adjust_type': '0',
+                'preload': 'true',
             }
-            
-            resp = requests.get(url, params=params, timeout=(5, 30))
+
+            resp = requests.get(url, params=params, timeout=(20, 180))
             if resp.status_code != 200:
                 return pd.DataFrame()
-            
+
             result = resp.json()
             if result.get('code') != 0:
                 return pd.DataFrame()
-            
+
             data_obj = result.get('data', {})
             records = data_obj.get('klines', []) if isinstance(data_obj, dict) else data_obj
-            
+
             if not records:
                 return pd.DataFrame()
             
@@ -521,7 +540,7 @@ class HistoricalDataPreloader:
             else:
                 # 同时检查大小写两种周期格式
                 tables_to_check = []
-                for suffix in ['raw', 'hfq']:
+                for suffix in ['raw', 'hfq', 'qfq']:
                     tables_to_check.append(f"{continuous_symbol}_{period.lower()}_{suffix}")
                     tables_to_check.append(f"{continuous_symbol}_{period.upper()}_{suffix}")
             

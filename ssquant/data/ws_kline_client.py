@@ -64,6 +64,7 @@ class WSKlineClient:
     """
     
     def __init__(self, ws_url: str = 'ws://localhost:8087',
+                 ws_urls: Optional[List[str]] = None,
                  auto_reconnect: bool = True,
                  reconnect_interval: float = 5.0,
                  max_reconnect_attempts: int = 0):
@@ -71,12 +72,19 @@ class WSKlineClient:
         初始化 WebSocket K线客户端
         
         Args:
-            ws_url: data_server WebSocket 地址
+            ws_url: data_server WebSocket 地址（单地址时与 ws_urls 二选一）
+            ws_urls: 多个 WebSocket 地址，主地址在前；断线重连时轮询下一地址
             auto_reconnect: 是否自动重连
             reconnect_interval: 重连间隔（秒）
             max_reconnect_attempts: 最大重连次数，0=无限
         """
-        self.ws_url = ws_url
+        if ws_urls:
+            self.ws_urls = list(ws_urls)
+        else:
+            self.ws_urls = [ws_url]
+        self.ws_url = self.ws_urls[0]  # 兼容旧代码：当前主展示用
+        self._url_index = 0
+        self._ever_connected = False
         self.auto_reconnect = auto_reconnect
         self.reconnect_interval = reconnect_interval
         self.max_reconnect_attempts = max_reconnect_attempts
@@ -87,6 +95,7 @@ class WSKlineClient:
         self.on_connected: Optional[Callable] = None       # on_connected()
         self.on_disconnected: Optional[Callable] = None    # on_disconnected()
         self.on_error: Optional[Callable] = None           # on_error(error_msg)
+        self.on_auth_required: Optional[Callable] = None   # 服务端要求重新鉴权时触发
         
         # ========== 连接状态 ==========
         self._ws = None              # websocket-client 同步连接引用
@@ -97,6 +106,7 @@ class WSKlineClient:
         self._connected = False
         self._connect_event = threading.Event()
         self._reconnect_count = 0
+        self._need_reauth = False
         
         # ========== 订阅管理 ==========
         self._pending_subscriptions: List[Dict] = []
@@ -118,6 +128,17 @@ class WSKlineClient:
     def connected(self) -> bool:
         """是否已连接"""
         return self._connected
+    
+    @property
+    def _current_ws_url(self) -> str:
+        return self.ws_urls[self._url_index % len(self.ws_urls)]
+    
+    def _notify_endpoint_connected(self):
+        try:
+            from ..data.auth_manager import set_active_endpoint_index
+            set_active_endpoint_index(self._url_index)
+        except Exception:
+            pass
     
     def connect(self, timeout: float = 10.0) -> bool:
         """
@@ -145,7 +166,7 @@ class WSKlineClient:
         
         success = self._connect_event.wait(timeout=timeout)
         if success:
-            print(f"[WSKlineClient] ✅ 已连接 {self.ws_url}")
+            print(f"[WSKlineClient] ✅ 已连接 {self._current_ws_url}")
         else:
             print(f"[WSKlineClient] ⚠️ 连接超时 ({timeout}s)，将在后台继续重连")
         
@@ -198,6 +219,15 @@ class WSKlineClient:
     def _run_loop(self):
         """后台运行循环（处理连接和重连）"""
         while self._running:
+            if self._need_reauth and self.on_auth_required:
+                print("[WSKlineClient] 服务端要求重新鉴权，正在重新验证...")
+                try:
+                    self.on_auth_required()
+                    print("[WSKlineClient] 重新鉴权完成")
+                except Exception as e:
+                    print(f"[WSKlineClient] 重新鉴权失败: {e}")
+                self._need_reauth = False
+            
             try:
                 self._do_connect()
             except Exception as e:
@@ -216,6 +246,10 @@ class WSKlineClient:
                 print(f"[WSKlineClient] 达到最大重连次数 ({self.max_reconnect_attempts})，停止重连")
                 break
             
+            if len(self.ws_urls) > 1:
+                self._url_index = (self._url_index + 1) % len(self.ws_urls)
+                print(f"[WSKlineClient] 切换 data_server 地址 → {self._current_ws_url}")
+            
             self._reconnect_count += 1
             self.stats['reconnect_count'] = self._reconnect_count
             print(f"[WSKlineClient] {self.reconnect_interval}s 后重连 (第{self._reconnect_count}次)...")
@@ -233,7 +267,7 @@ class WSKlineClient:
         
         # 使用 websocket-client（同步库，推荐）
         self._ws = websocket.WebSocketApp(
-            self.ws_url,
+            self._current_ws_url,
             on_open=self._on_open,
             on_message=self._on_message,
             on_error=self._on_ws_error,
@@ -257,7 +291,7 @@ class WSKlineClient:
         async def _run():
             try:
                 async with ws_lib.connect(
-                    self.ws_url,
+                    self._current_ws_url,
                     ping_interval=30,
                     ping_timeout=10,
                     close_timeout=5,
@@ -265,10 +299,13 @@ class WSKlineClient:
                 ) as ws:
                     self._async_ws = ws
                     self._connected = True
+                    self.ws_url = self._current_ws_url
+                    self._notify_endpoint_connected()
                     self._reconnect_count = 0
                     self._connect_event.set()
                     
-                    is_reconnect = self.stats['reconnect_count'] > 0
+                    is_reconnect = self._ever_connected
+                    self._ever_connected = True
                     
                     if is_reconnect:
                         with self._sub_lock:
@@ -285,6 +322,11 @@ class WSKlineClient:
                             break
                         self._handle_message(message)
                         
+            except ws_lib.exceptions.ConnectionClosedError as e:
+                if getattr(e, 'code', None) == 4001:
+                    self._need_reauth = True
+                if self._running:
+                    print(f"[WSKlineClient] async连接关闭: code={getattr(e, 'code', '?')}")
             except Exception as e:
                 if self._running:
                     print(f"[WSKlineClient] async连接异常: {e}")
@@ -327,10 +369,12 @@ class WSKlineClient:
     def _on_open(self, ws):
         """WebSocket连接成功"""
         self._connected = True
+        self.ws_url = self._current_ws_url
+        self._notify_endpoint_connected()
+        is_reconnect = self._ever_connected
+        self._ever_connected = True
         self._reconnect_count = 0
         self._connect_event.set()
-        
-        is_reconnect = self.stats['reconnect_count'] > 0
         
         if is_reconnect:
             print(f"[WSKlineClient] 重连成功，恢复 {len(self._active_subscriptions)} 个订阅")
@@ -366,6 +410,8 @@ class WSKlineClient:
     def _on_close(self, ws, close_status_code=None, close_msg=None):
         """WebSocket关闭"""
         self._connected = False
+        if close_status_code == 4001:
+            self._need_reauth = True
         if self.on_disconnected:
             try:
                 self.on_disconnected()

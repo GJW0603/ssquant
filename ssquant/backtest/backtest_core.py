@@ -233,7 +233,20 @@ class MultiSourceBacktester:
             'curr_margin': 0,                 # 占用保证金
             'update_time': None,              # 更新时间
             'initial_capital': initial_capital,  # 初始资金
+            '_last_order_rejected_for_funds': False,
+            '_fund_reject_count': 0,
+            '_last_fund_reject_reason': "",
         }
+
+        def sync_backtest_account():
+            self._update_backtest_account(backtest_account_info, multi_data_source, self.symbol_configs)
+
+        for ds in multi_data_source.data_sources:
+            ds.configure_backtest_context(
+                symbol_config=self.symbol_configs.get(ds.symbol, {}),
+                account_info=backtest_account_info,
+                account_sync_callback=sync_backtest_account
+            )
         
         # 创建策略上下文
         context = {
@@ -256,9 +269,13 @@ class MultiSourceBacktester:
         progress_last_update = time.time()
         progress_update_interval = 0.5  # 每0.5秒更新一次进度条
         progress_bar_length = 50  # 进度条长度
+        executed_length = 0
+        stopped_early = False
         
         # 逐条数据运行策略
         for i in range(total_length):
+            backtest_account_info['_last_order_rejected_for_funds'] = False
+
             # 更新所有数据源的当前索引
             for ds in multi_data_source.data_sources:
                 if not ds.data.empty and i < len(ds.data):
@@ -309,10 +326,26 @@ class MultiSourceBacktester:
             
             # 运行策略
             strategy_func(api)
+            executed_length = i + 1
+
+            if backtest_account_info.get('_last_order_rejected_for_funds'):
+                no_positions = all(ds.current_pos == 0 for ds in multi_data_source.data_sources)
+                no_pending_orders = all(not ds.pending_orders for ds in multi_data_source.data_sources)
+                if no_positions and no_pending_orders:
+                    last_reason = backtest_account_info.get('_last_fund_reject_reason', '')
+                    self.logger.log_important("回测提前停止：初始资金已无法支持新的开仓，且当前无持仓/无待执行订单。")
+                    if last_reason:
+                        self.logger.log_important(f"停止原因摘要：{last_reason}")
+                    stopped_early = True
+                    break
         
         # 完成进度条（仅在非优化模式下显示）
         if not self._in_optimization_mode:
-            print(f"\r回测进度: |{'█' * progress_bar_length}| 100.0% ({total_length}/{total_length}) [完成]", flush=True)
+            final_progress = float(executed_length) / total_length if total_length > 0 else 1.0
+            filled_length = int(progress_bar_length * final_progress)
+            bar = '█' * filled_length + '-' * (progress_bar_length - filled_length)
+            status_text = "提前停止" if stopped_early else "完成"
+            print(f"\r回测进度: |{bar}| {final_progress*100:.1f}% ({executed_length}/{total_length}) [{status_text}]", flush=True)
             print()  # 添加一个换行
         
         # 记录回测结束时间
@@ -320,12 +353,30 @@ class MultiSourceBacktester:
         elapsed_time = end_time - start_time
         self.logger.log_message(f"回测完成，耗时: {elapsed_time:.2f}秒")
         
+        multi_data_source.backtest_executed_length = executed_length
+        multi_data_source.backtest_stopped_early = stopped_early
+        for ds in multi_data_source.data_sources:
+            ds.result_end_idx = min(executed_length, len(ds.data)) if executed_length > 0 else 0
+
         # 计算回测结果
         results = self.result_calculator.calculate_results(multi_data_source, self.symbol_configs)
         self.results = results
         
         # 将multi_data_source保存到结果中，以便后续使用
         self._last_multi_data_source = multi_data_source
+
+        fund_reject_count = int(backtest_account_info.get('_fund_reject_count', 0) or 0)
+        if fund_reject_count > 0:
+            last_reason = backtest_account_info.get('_last_fund_reject_reason', '')
+            self.logger.log_important(
+                f"框架提示：本次回测共发生 {fund_reject_count} 次资金不足拒单。"
+            )
+            if last_reason:
+                self.logger.log_important(f"最近一次拒单原因：{last_reason}")
+            if all(len(ds.trades) == 0 for ds in multi_data_source.data_sources):
+                self.logger.log_important(
+                    "框架提示：本次回测最终没有成交记录，主要原因是开仓信号触发后被资金约束拦截。"
+                )
         
         return results
     
@@ -345,40 +396,27 @@ class MultiSourceBacktester:
         total_close_profit = 0
         total_margin = 0
         total_commission = 0
+        total_frozen = 0
         
         for ds in multi_data_source.data_sources:
-            # 获取品种配置
-            symbol = ds.symbol
-            config = symbol_configs.get(symbol, {})
-            contract_multiplier = config.get('contract_multiplier', 10)
-            margin_rate = config.get('margin_rate', 0.1)
-            
-            # 计算当前持仓市值和保证金
-            current_price = ds.current_price or 0
-            current_pos = ds.current_pos
-            
-            if current_pos != 0:
-                # 保证金 = 当前价格 * 持仓量 * 合约乘数 * 保证金率
-                margin = abs(current_pos) * current_price * contract_multiplier * margin_rate
-                total_margin += margin
-                
-                # 持仓盈亏需要知道开仓价格，这里简化处理
-                # 实际应该从交易记录中计算，这里暂时设为0
-            
-            # 累计平仓盈亏和手续费（从交易记录中获取）
-            for trade in ds.trades:
-                if 'net_profit' in trade:
-                    total_close_profit += trade['net_profit']
-                if 'commission' in trade:
-                    total_commission += trade['commission']
+            snapshot = ds.get_runtime_account_snapshot(ds.current_price)
+            total_margin += float(snapshot.get('curr_margin', 0) or 0.0)
+            total_position_profit += float(snapshot.get('position_profit', 0) or 0.0)
+            total_close_profit += float(snapshot.get('close_profit', 0) or 0.0)
+            total_commission += float(snapshot.get('commission', 0) or 0.0)
+
+            for order in getattr(ds, 'pending_orders', []):
+                if order.get('action') in ('开多', '开空'):
+                    total_frozen += float(order.get('reserved_funds', 0) or 0.0)
         
         # 更新账户信息
+        account_info['frozen_margin'] = total_frozen
         account_info['curr_margin'] = total_margin
         account_info['close_profit'] = total_close_profit
         account_info['commission'] = total_commission
         account_info['position_profit'] = total_position_profit
         account_info['balance'] = initial_capital + total_close_profit + total_position_profit - total_commission
-        account_info['available'] = account_info['balance'] - total_margin
+        account_info['available'] = account_info['balance'] - total_margin - total_frozen
         
         # 更新时间
         for ds in multi_data_source.data_sources:

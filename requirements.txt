@@ -13,7 +13,7 @@ plotly>=5.18.0
 akshare>=1.10.0
 
 # 以下依赖已废弃，保留用于兼容（可选）
-# matplotlib>=3.5.0
+matplotlib>=3.5.0
 # scipy>=1.7.0
 # Pillow>=8.0.0
 

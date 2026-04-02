@@ -69,7 +69,7 @@ class SIMNOWMdSpi(MdSpi):
         """登录响应"""
         if pRspInfo and pRspInfo.ErrorID != 0:
             error_msg = self._decode_error_msg(pRspInfo.ErrorMsg)
-            full_msg = self._get_error_desc(pRspInfo.ErrorID, error_msg)
+            full_msg = self._format_error_output(pRspInfo.ErrorID, error_msg)
             print(f"[{self._timestamp()}] [行情] 登录失败: {full_msg}")
             return
         
@@ -93,7 +93,7 @@ class SIMNOWMdSpi(MdSpi):
         """订阅行情响应"""
         if pRspInfo and pRspInfo.ErrorID != 0:
             error_msg = self._decode_error_msg(pRspInfo.ErrorMsg)
-            full_msg = self._get_error_desc(pRspInfo.ErrorID, error_msg)
+            full_msg = self._format_error_output(pRspInfo.ErrorID, error_msg)
             print(f"[{self._timestamp()}] [行情] 订阅失败: {full_msg}")
         else:
             if pSpecificInstrument:
@@ -220,7 +220,7 @@ class SIMNOWTraderSpi(TraderSpi):
         """认证响应"""
         if pRspInfo and pRspInfo.ErrorID != 0:
             error_msg = self._decode_error_msg(pRspInfo.ErrorMsg)
-            full_msg = self._get_error_desc(pRspInfo.ErrorID, error_msg)
+            full_msg = self._format_error_output(pRspInfo.ErrorID, error_msg)
             print(f"[{self._timestamp()}] [交易] 认证失败: {full_msg}")
             
             # 认证失败后持续重试（服务器可能还未完全就绪，如收盘后CTP自动重连）
@@ -304,7 +304,7 @@ class SIMNOWTraderSpi(TraderSpi):
                 
                 # 新版详细撤单回调
                 if self.client.on_cancel:
-                    status_msg = self._decode_error_msg(pOrder.StatusMsg) if pOrder.StatusMsg else ""
+                    status_msg = self._clean_exchange_text(self._decode_error_msg(pOrder.StatusMsg)) if pOrder.StatusMsg else ""
                     cancel_data = {
                         'InstrumentID': pOrder.InstrumentID,
                         'OrderRef': pOrder.OrderRef,
@@ -324,7 +324,7 @@ class SIMNOWTraderSpi(TraderSpi):
             # 报单回调
             if self.client.on_order:
                 # 解码状态消息（可能是GBK编码）
-                status_msg = self._decode_error_msg(pOrder.StatusMsg) if pOrder.StatusMsg else ""
+                status_msg = self._clean_exchange_text(self._decode_error_msg(pOrder.StatusMsg)) if pOrder.StatusMsg else ""
                 
                 data = {
                     'InstrumentID': pOrder.InstrumentID,
@@ -378,7 +378,7 @@ class SIMNOWTraderSpi(TraderSpi):
         """报单错误"""
         if pRspInfo and pRspInfo.ErrorID != 0:
             error_msg = self._decode_error_msg(pRspInfo.ErrorMsg)
-            full_msg = self._get_error_desc(pRspInfo.ErrorID, error_msg)
+            full_msg = self._format_error_output(pRspInfo.ErrorID, error_msg)
             print(f"[{self._timestamp()}] [交易] 报单失败: {full_msg}")
             
             # 智能追单重试逻辑
@@ -416,7 +416,7 @@ class SIMNOWTraderSpi(TraderSpi):
             
             # 获取品种信息
             instrument_id = pInputOrder.InstrumentID if pInputOrder else "未知品种"
-            print(f"[{self._timestamp()}] [交易] 报单失败: {instrument_id} - {pRspInfo.ErrorID} - {full_msg}")
+            print(f"[{self._timestamp()}] [交易] 报单失败: {instrument_id} - {full_msg}")
             if self.client.on_order_error:
                 self.client.on_order_error(pRspInfo.ErrorID, full_msg, instrument_id)
     
@@ -424,9 +424,10 @@ class SIMNOWTraderSpi(TraderSpi):
         """撤单请求响应"""
         if pRspInfo and pRspInfo.ErrorID != 0:
             error_msg = self._decode_error_msg(pRspInfo.ErrorMsg)
-            print(f"[{self._timestamp()}] [交易] 撤单请求失败: {pRspInfo.ErrorID} - {error_msg}")
+            full_msg = self._format_error_output(pRspInfo.ErrorID, error_msg)
+            print(f"[{self._timestamp()}] [交易] 撤单请求失败: {full_msg}")
             if self.client.on_cancel_error:
-                self.client.on_cancel_error(pRspInfo.ErrorID, error_msg)
+                self.client.on_cancel_error(pRspInfo.ErrorID, full_msg)
         else:
             # 撤单请求已接受，等待报单状态变为'5'时才真正撤单成功
             print(f"[{self._timestamp()}] [交易] 撤单请求已接受，等待确认...")
@@ -435,7 +436,7 @@ class SIMNOWTraderSpi(TraderSpi):
         """查询资金账户响应"""
         if pRspInfo and pRspInfo.ErrorID != 0:
             error_msg = self._decode_error_msg(pRspInfo.ErrorMsg)
-            full_msg = self._get_error_desc(pRspInfo.ErrorID, error_msg)
+            full_msg = self._format_error_output(pRspInfo.ErrorID, error_msg)
             print(f"[{self._timestamp()}] [交易] 查询资金失败: {full_msg}")
             return
         
@@ -458,7 +459,8 @@ class SIMNOWTraderSpi(TraderSpi):
         """查询持仓响应"""
         if pRspInfo and pRspInfo.ErrorID != 0:
             error_msg = self._decode_error_msg(pRspInfo.ErrorMsg)
-            print(f"[{self._timestamp()}] [交易] 查询持仓失败: {pRspInfo.ErrorID} - {error_msg}")
+            full_msg = self._format_error_output(pRspInfo.ErrorID, error_msg)
+            print(f"[{self._timestamp()}] [交易] 查询持仓失败: {full_msg}")
             return
         
         if pInvestorPosition and self.client.on_position:
@@ -515,12 +517,13 @@ class SIMNOWTraderSpi(TraderSpi):
         """查询报单响应"""
         if pRspInfo and pRspInfo.ErrorID != 0:
             error_msg = self._decode_error_msg(pRspInfo.ErrorMsg)
-            print(f"[{self._timestamp()}] [交易] 查询订单失败: {pRspInfo.ErrorID} - {error_msg}")
+            full_msg = self._format_error_output(pRspInfo.ErrorID, error_msg)
+            print(f"[{self._timestamp()}] [交易] 查询订单失败: {full_msg}")
             return
         
         if pOrder and self.client.on_query_order:
             # 解码状态消息（可能是GBK编码）
-            status_msg = self._decode_error_msg(pOrder.StatusMsg) if pOrder.StatusMsg else ""
+            status_msg = self._clean_exchange_text(self._decode_error_msg(pOrder.StatusMsg)) if pOrder.StatusMsg else ""
             
             data = {
                 'InstrumentID': pOrder.InstrumentID,
@@ -547,7 +550,7 @@ class SIMNOWTraderSpi(TraderSpi):
         """查询成交响应"""
         if pRspInfo and pRspInfo.ErrorID != 0:
             error_msg = self._decode_error_msg(pRspInfo.ErrorMsg)
-            full_msg = self._get_error_desc(pRspInfo.ErrorID, error_msg)
+            full_msg = self._format_error_output(pRspInfo.ErrorID, error_msg)
             print(f"[{self._timestamp()}] [交易] 查询成交失败: {full_msg}")
             return
         
@@ -604,6 +607,26 @@ class SIMNOWTraderSpi(TraderSpi):
             except:
                 pass
         return str(error_msg)
+
+    def _is_garbled_text(self, text: str) -> bool:
+        """粗略判断文本是否已乱码。"""
+        if not text:
+            return False
+        if text.startswith("RawBytes(") or text == "解码失败(含替换符)":
+            return True
+        suspicious = 0
+        for ch in text[:40]:
+            code = ord(ch)
+            if 127 < code < 256:
+                suspicious += 1
+        return suspicious >= 3
+
+    def _clean_exchange_text(self, text: str) -> str:
+        """清理交易所原始文本，明显乱码时直接隐藏。"""
+        text = str(text or "").strip()
+        if not text or self._is_garbled_text(text):
+            return ""
+        return text
     
     def _get_error_desc(self, error_id: int, error_msg: str) -> str:
         """获取错误描述（添加常见错误的中文说明）"""
@@ -647,6 +670,14 @@ class SIMNOWTraderSpi(TraderSpi):
                 pass
             return error_msg
         return f"未知错误（错误码: {error_id}）"
+
+    def _format_error_output(self, error_id: int, error_msg: str) -> str:
+        """统一输出：错误码 + 中文解释，原始消息仅在可读时附带。"""
+        clean_msg = self._clean_exchange_text(error_msg)
+        desc = self._get_error_desc(error_id, clean_msg)
+        if clean_msg and clean_msg != desc and clean_msg not in desc:
+            return f"错误码={error_id} - {desc} | 原始消息: {clean_msg}"
+        return f"错误码={error_id} - {desc}"
     
     def get_next_order_ref(self):
         """获取下一个报单引用"""

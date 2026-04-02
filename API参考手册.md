@@ -1,17 +1,21 @@
 # API参考手册
 
-> 完整的API函数参考
+> SSQuant v0.4.3 完整API参考
 
 ## 📖 目录
 
 1. [数据查询API](#数据查询api)
 2. [持仓查询API](#持仓查询api)
 3. [交易操作API](#交易操作api)
-4. [TICK数据API](#tick数据api)
-5. [多数据源API](#多数据源api)
-6. [参数和日志API](#参数和日志api)
-7. [实盘专用API](#实盘专用api)
-8. [回调函数](#回调函数)
+4. [账户资金API](#账户资金api)
+5. [TICK数据API](#tick数据api)
+6. [多数据源API](#多数据源api)
+7. [参数和日志API](#参数和日志api)
+8. [运行时状态API](#运行时状态api)
+9. [自动移仓API](#自动移仓api)
+10. [实盘专用API](#实盘专用api)
+11. [回调函数](#回调函数)
+12. [配置参数参考](#配置参数参考)
 
 ---
 
@@ -41,12 +45,6 @@ current_price = close.iloc[-1]
 
 获取开盘价序列。
 
-**参数：**
-- `index` (int): 数据源索引
-
-**返回：**
-- `pd.Series`: 开盘价序列
-
 ---
 
 ### api.get_high(index=0)
@@ -67,39 +65,49 @@ current_price = close.iloc[-1]
 
 ---
 
-### api.get_klines(index=0)
+### api.get_klines(index=0, window=None)
 
 获取完整的K线数据。
 
+**参数：**
+- `index` (int): 数据源索引
+- `window` (int/None): 滑动窗口大小。`None` = 使用配置的 `lookback_bars`，`0` = 不限制（全部历史）
+
 **返回：**
-- `pd.DataFrame`: 包含以下列
-  - `datetime`: 时间
-  - `open`: 开盘价
-  - `high`: 最高价
-  - `low`: 最低价
-  - `close`: 收盘价
-  - `volume`: 成交量
+- `pd.DataFrame`: 包含 `datetime`, `open`, `high`, `low`, `close`, `volume` 等列。data_server 模式下还包含订单流字段。
 
 **示例：**
 
 ```python
 klines = api.get_klines()
-print(klines.columns)
-# ['datetime', 'open', 'high', 'low', 'close', 'volume']
-
-# 获取最新K线数据
 latest = klines.iloc[-1]
-print(f"最新价: {latest['close']}")
+
+# 指定获取最近100条
+klines = api.get_klines(0, window=100)
+
+# 获取全部数据
+klines = api.get_klines(0, window=0)
 ```
 
 ---
 
 ### api.get_price(index=0)
 
-获取当前价格（最新收盘价）。
+获取当前价格。在复权模式下返回复权后价格，与 `get_close()` 口径一致。
 
 **返回：**
-- `float`: 当前价格
+- `float/None`: 当前价格
+
+---
+
+### api.get_raw_price(index=0)
+
+获取原始未复权价格，更接近底层行情/委托定价口径。
+
+**返回：**
+- `float/None`: 未复权价格
+
+> 💡 下单时框架内部使用原始价格，策略分析建议使用 `get_price()`。
 
 ---
 
@@ -119,11 +127,8 @@ print(f"最新价: {latest['close']}")
 **返回：**
 - `int`: 当前索引
 
-**用途：** 判断数据是否足够、防止策略在数据不足时执行
-
 ```python
-current_idx = api.get_idx()
-if current_idx < 20:
+if api.get_idx() < 20:
     return  # 数据不足，跳过
 ```
 
@@ -136,50 +141,35 @@ if current_idx < 20:
 获取净持仓。
 
 **返回：**
-- `int`: 持仓数量
-  - 正数：多头持仓
-  - 负数：空头持仓
-  - 0：无持仓
-
-**示例：**
+- `int`: 正数=多头，负数=空头，0=无持仓
 
 ```python
 pos = api.get_pos()
-
 if pos > 0:
     print(f"持有{pos}手多仓")
 elif pos < 0:
     print(f"持有{-pos}手空仓")
-else:
-    print("无持仓")
 ```
 
 ---
 
 ### api.get_long_pos(index=0)
 
-获取多头持仓数量。
-
-**返回：**
-- `int`: 多头持仓（非负数）
+获取多头持仓数量（非负数）。
 
 ---
 
 ### api.get_short_pos(index=0)
 
-获取空头持仓数量。
-
-**返回：**
-- `int`: 空头持仓（非负数）
+获取空头持仓数量（非负数）。
 
 ---
 
 ### api.get_position_detail(index=0)
 
-获取详细持仓信息（包含今昨仓）。
+获取详细持仓信息。
 
-**返回：**
-- `dict`: 包含以下字段
+**返回字段：**
 
 | 字段 | 说明 |
 |------|------|
@@ -193,13 +183,9 @@ else:
 | `long_yd` | 多头昨仓 |
 | `short_yd` | 空头昨仓 |
 
-**示例：**
-
 ```python
 detail = api.get_position_detail()
 print(f"多头: {detail['long_pos']} (今:{detail['long_today']} 昨:{detail['long_yd']})")
-print(f"空头: {detail['short_pos']} (今:{detail['short_today']} 昨:{detail['short_yd']})")
-print(f"净持仓: {detail['net_pos']}")
 ```
 
 ---
@@ -216,9 +202,10 @@ print(f"净持仓: {detail['net_pos']}")
 |------|------|--------|------|
 | `volume` | int | 1 | 手数 |
 | `reason` | str | "" | 交易原因 |
-| `order_type` | str | 'bar_close' | 订单类型 |
+| `order_type` | str | `'bar_close'` | 订单类型 |
 | `index` | int | 0 | 数据源索引 |
-| `offset_ticks` | int/None | None | 价格偏移 |
+| `offset_ticks` | int/None | None | 价格偏移（覆盖配置） |
+| `price` | float/None | None | 限价单价格 |
 
 **order_type 选项：**
 
@@ -232,30 +219,17 @@ print(f"净持仓: {detail['net_pos']}")
 | `'market'` | 对价成交 | 市价/超价委托 |
 | `'limit'` | (不支持) | 限价单 |
 
-**注意：**
-- 当 `order_type='limit'` 时，必须提供 `price` 参数。
-- 也可以不指定 `order_type`，直接提供 `price` 参数，框架会自动识别为限价单。
-
 **示例：**
 
 ```python
-# 基础用法
 api.buy(volume=1, order_type='next_bar_open')
-
-# 带原因
 api.buy(volume=1, reason='金叉信号', order_type='next_bar_open')
-
-# 实盘超价委托 (市价单)
 api.buy(volume=1, order_type='market', offset_ticks=10)
-
-# 限价单 (Limit Order) - 挂单排队
-api.buy(volume=1, price=3500.0)
-# 或者
+api.buy(volume=1, price=3500.0)  # 限价单
 api.buy(volume=1, order_type='limit', price=3500.0)
-
-# 多数据源
-api.buy(volume=1, order_type='next_bar_open', index=1)
 ```
+
+> v0.4.3: 回测模式下资金不足时会自动裁剪手数或拒单。
 
 ---
 
@@ -269,36 +243,22 @@ api.buy(volume=1, order_type='next_bar_open', index=1)
 |------|------|--------|------|
 | `volume` | int/None | None | 手数，None=平所有多仓 |
 | `reason` | str | "" | 交易原因 |
-| `order_type` | str | 'bar_close' | 订单类型 |
+| `order_type` | str | `'bar_close'` | 订单类型 |
 | `index` | int | 0 | 数据源索引 |
 | `offset_ticks` | int/None | None | 价格偏移 |
 | `price` | float/None | None | 限价单价格 |
 
-**示例：**
-
 ```python
-# 平所有多仓
-api.sell(order_type='next_bar_open')
-
-# 平指定手数
-api.sell(volume=2, order_type='next_bar_open')
-
-# 限价平仓
-api.sell(volume=1, price=3600.0)
-
-# 带止损原因
-api.sell(order_type='next_bar_open', reason='止损')
+api.sell(order_type='next_bar_open')       # 平所有多仓
+api.sell(volume=2, order_type='next_bar_open')  # 平指定手数
+api.sell(volume=1, price=3600.0)           # 限价平仓
 ```
 
 ---
 
 ### api.sellshort()
 
-卖出开仓（做空）。
-
-**参数：** 同 `api.buy()`
-
-**示例：**
+卖出开仓（做空）。参数同 `api.buy()`。
 
 ```python
 api.sellshort(volume=1, order_type='next_bar_open')
@@ -308,14 +268,9 @@ api.sellshort(volume=1, order_type='next_bar_open')
 
 ### api.buycover()
 
-买入平仓（平空）。
-
-**参数：** 同 `api.sell()`
-
-**示例：**
+买入平仓（平空）。参数同 `api.sell()`。
 
 ```python
-# 平所有空仓
 api.buycover(order_type='next_bar_open')
 ```
 
@@ -327,16 +282,9 @@ api.buycover(order_type='next_bar_open')
 
 ---
 
-### api.close_all()
+### api.close_all(reason="", order_type='bar_close', index=0)
 
 平掉所有持仓（多头和空头）。
-
-**参数：**
-- `reason` (str): 交易原因
-- `order_type` (str): 订单类型
-- `index` (int): 数据源索引
-
-**示例：**
 
 ```python
 api.close_all(order_type='next_bar_open', reason='收盘平仓')
@@ -344,30 +292,114 @@ api.close_all(order_type='next_bar_open', reason='收盘平仓')
 
 ---
 
-### api.reverse_pos()
+### api.reverse_pos(reason="", order_type='bar_close', index=0)
 
 反手（多转空，空转多）。
 
-**示例：**
-
 ```python
-# 如果当前持多仓，会平多开空
-# 如果当前持空仓，会平空开多
 api.reverse_pos(order_type='next_bar_open')
 ```
 
 ---
 
+## 账户资金API
+
+> 以下API仅在 SIMNOW/实盘 模式下有效，回测模式返回0。
+
+### api.get_account()
+
+获取完整账户信息。
+
+**返回字段：**
+
+| 字段 | 说明 |
+|------|------|
+| `balance` | 账户权益 |
+| `available` | 可用资金 |
+| `position_profit` | 持仓盈亏 |
+| `close_profit` | 平仓盈亏 |
+| `commission` | 手续费 |
+| `frozen_margin` | 冻结保证金 |
+| `curr_margin` | 占用保证金 |
+| `update_time` | 更新时间 |
+
+```python
+account = api.get_account()
+print(f"权益: {account['balance']}, 可用: {account['available']}")
+```
+
+---
+
+### api.get_balance()
+
+获取账户权益。
+
+---
+
+### api.get_available()
+
+获取可用资金。
+
+---
+
+### api.get_position_profit()
+
+获取持仓浮动盈亏。
+
+---
+
+### api.get_close_profit()
+
+获取当日平仓盈亏。
+
+---
+
+### api.get_margin()
+
+获取当前占用保证金。
+
+---
+
+### api.get_commission()
+
+获取当日手续费。
+
+---
+
+### api.query_account()
+
+主动触发CTP账户查询。查询后等待 0.3-0.5 秒再读取。
+
+```python
+api.query_account()
+import time
+time.sleep(0.5)
+account = api.get_account()
+```
+
+> CTP 有查询频率限制，建议不要频繁调用。
+
+---
+
+### api.query_position(symbol="")
+
+主动查询持仓。空字符串=查询所有持仓。
+
+---
+
+### api.query_trades(symbol="")
+
+主动查询当日成交记录。
+
+---
+
 ## TICK数据API
 
-> ⚠️ TICK数据仅在 SIMNOW/实盘 模式下可用，回测模式返回None
+> TICK数据仅在 SIMNOW/实盘 模式下可用，回测模式返回None
 
 ### api.get_tick(index=0)
 
 获取当前TICK数据。
-
-**返回：**
-- `dict/None`: TICK数据字典，回测模式返回None
 
 **常用字段：**
 
@@ -387,8 +419,6 @@ api.reverse_pos(order_type='next_bar_open')
 | `UpdateTime` | 时间(HH:MM:SS) |
 | `UpdateMillisec` | 毫秒 |
 
-**示例：**
-
 ```python
 tick = api.get_tick()
 if tick:
@@ -399,18 +429,12 @@ if tick:
 
 ---
 
-### api.get_ticks(window=100, index=0)
+### api.get_ticks(window=None, index=0)
 
 获取最近N个TICK数据。
 
 **参数：**
-- `window` (int): 窗口大小，默认100
-- `index` (int): 数据源索引
-
-**返回：**
-- `pd.DataFrame`: TICK数据表
-
-**示例：**
+- `window` (int/None): 窗口大小，None=使用 `lookback_bars`，`0`=全部缓存
 
 ```python
 ticks = api.get_ticks(window=50)
@@ -422,11 +446,6 @@ print(f"最近50个TICK的平均价: {ticks['LastPrice'].mean():.2f}")
 ### api.get_ticks_count(index=0)
 
 获取当前缓存的TICK数据总数。
-
-**返回：**
-- `int`: TICK数据条数
-
-**示例：**
 
 ```python
 tick_count = api.get_ticks_count()
@@ -441,24 +460,16 @@ all_ticks = api.get_ticks(window=tick_count)
 
 获取数据源数量。
 
-**返回：**
-- `int`: 数据源数量
-
 ---
 
 ### api.get_data_source(index)
 
 获取指定数据源对象。
 
-**返回：**
-- `DataSource`: 数据源对象
-
-**示例：**
-
 ```python
 ds = api.get_data_source(0)
-print(ds.symbol)        # 品种代码
-print(ds.kline_period)  # K线周期
+print(ds.symbol)
+print(ds.kline_period)
 ```
 
 ---
@@ -467,21 +478,10 @@ print(ds.kline_period)  # K线周期
 
 确保至少有指定数量的数据源。
 
-**参数：**
-- `count` (int): 最少数量
-
-**返回：**
-- `bool`: 是否满足要求
-
-**示例：**
-
 ```python
-def multi_symbol_strategy(api):
-    # 确保至少有2个数据源
+def multi_strategy(api):
     if not api.require_data_sources(2):
         return
-    
-    # 继续策略逻辑...
 ```
 
 ---
@@ -491,7 +491,6 @@ def multi_symbol_strategy(api):
 所有数据和交易API都支持 `index` 参数：
 
 ```python
-# 配置多数据源
 config = get_config(
     mode=RunMode.BACKTEST,
     data_sources=[
@@ -500,16 +499,10 @@ config = get_config(
     ],
 )
 
-# 策略中访问
 def multi_strategy(api):
-    # 第一个品种（rb）index=0
     close_rb = api.get_close(index=0)
-    pos_rb = api.get_pos(index=0)
-    api.buy(volume=1, index=0)
-    
-    # 第二个品种（i）index=1
     close_i = api.get_close(index=1)
-    pos_i = api.get_pos(index=1)
+    api.buy(volume=1, index=0)
     api.buy(volume=1, index=1)
 ```
 
@@ -521,14 +514,7 @@ def multi_strategy(api):
 
 获取策略参数。
 
-**参数：**
-- `key` (str): 参数名
-- `default`: 默认值
-
-**示例：**
-
 ```python
-# 运行时传入参数
 runner.run(
     strategy=my_strategy,
     strategy_params={'ma_period': 20, 'stop_loss': 0.05}
@@ -536,17 +522,13 @@ runner.run(
 
 # 策略中获取
 ma_period = api.get_param('ma_period', 20)
-stop_loss = api.get_param('stop_loss', 0.05)
 ```
 
 ---
 
 ### api.get_params()
 
-获取所有参数。
-
-**返回：**
-- `dict`: 参数字典
+获取所有参数字典。
 
 ---
 
@@ -554,14 +536,96 @@ stop_loss = api.get_param('stop_loss', 0.05)
 
 记录日志。
 
-**参数：**
-- `message` (str): 日志消息
+```python
+api.log(f"当前价格: {price:.2f}, 持仓: {pos}")
+```
 
-**示例：**
+---
+
+## 运行时状态API
+
+> v0.4.3 新增。仅在 SIMNOW/实盘 模式下有效。
+
+### api.get_runtime_stats()
+
+获取运行时状态快照，包含队列积压、处理耗时、压力等级等。
+
+**返回：**
+- `dict`: 统计信息
+
+| 字段 | 说明 |
+|------|------|
+| `pressure_level` | 压力等级：`normal` / `busy` / `critical` |
+| `queue_size` | 当前队列长度 |
+| `high_water_mark` | 高水位值 |
+| `overflow_count` | 溢出缓冲累计次数 |
+| `compress_count` | 积压压缩次数 |
+
+---
+
+### api.get_runtime_pressure()
+
+获取运行时压力等级。
+
+**返回：**
+- `str`: `'normal'` / `'busy'` / `'critical'`
 
 ```python
-api.log("策略开始执行")
-api.log(f"当前价格: {price:.2f}, 持仓: {pos}")
+pressure = api.get_runtime_pressure()
+if pressure == 'critical':
+    api.log("系统高压，暂停交易")
+    return
+```
+
+---
+
+### api.is_runtime_under_pressure(level='busy')
+
+判断是否达到指定压力等级及以上。
+
+```python
+if api.is_runtime_under_pressure('busy'):
+    return  # 跳过本次
+```
+
+---
+
+## 自动移仓API
+
+> v0.4.3 新增。仅在启用自动移仓的 SIMNOW/实盘 模式下有效。
+
+### api.is_rollover_busy(index=0)
+
+当前数据源是否处于移仓等待闭环。
+
+**返回：**
+- `bool`: `True` = 正在移仓（已发移仓单、尚未确认完成）
+
+```python
+if api.is_rollover_busy():
+    return  # 移仓中，暂停交易信号
+```
+
+---
+
+### api.get_rollover_status()
+
+获取移仓状态快照。
+
+**返回结构：**
+
+```python
+{
+    'per_source': {
+        '0': {
+            'sent_for': 'rb2505',        # 正在移仓的旧合约（None=空闲）
+            'expected_vol': 1,            # 预期移仓手数
+            'expected_dir': 'long',       # 方向
+            'wait_invocations': 3,        # 等待次数
+            'seq_phase': 'wait_close',    # sequential模式阶段
+        }
+    }
+}
 ```
 
 ---
@@ -572,21 +636,10 @@ api.log(f"当前价格: {price:.2f}, 持仓: {pos}")
 
 撤销所有未成交订单。
 
-**注意：**
-- 仅实盘/SIMNOW有效
-- 回测模式无效果
-
-**示例：**
-
 ```python
-# 撤销所有订单
 api.cancel_all_orders()
-
-# 等待撤单完成
 import time
 time.sleep(0.3)
-
-# 重新下单
 api.buy(volume=1, order_type='market')
 ```
 
@@ -594,7 +647,7 @@ api.buy(volume=1, order_type='market')
 
 ### offset_ticks 参数
 
-在下单时临时指定价格偏移，覆盖配置中的 `order_offset_ticks`。
+下单时临时指定价格偏移，覆盖配置中的 `order_offset_ticks`。
 
 **委托价格计算：**
 
@@ -603,17 +656,10 @@ api.buy(volume=1, order_type='market')
 卖出委托价 = 买一价 - offset_ticks × price_tick
 ```
 
-**示例：**
-
 ```python
-# 使用配置中的order_offset_ticks
-api.buy(volume=1, order_type='market')
-
-# 临时超价委托（快速成交）
-api.buy(volume=1, order_type='market', offset_ticks=10)
-
-# 临时限价委托（降低成本）
-api.buy(volume=1, order_type='market', offset_ticks=-5)
+api.buy(volume=1, order_type='market')              # 使用配置值
+api.buy(volume=1, order_type='market', offset_ticks=10)   # 超价
+api.buy(volume=1, order_type='market', offset_ticks=-5)   # 折价
 ```
 
 ---
@@ -624,43 +670,32 @@ api.buy(volume=1, order_type='market', offset_ticks=-5)
 
 ### on_trade(data)
 
-成交回调，当订单成交时触发。
-
-**参数 data 字段：**
+成交回调。
 
 | 字段 | 说明 | 类型 |
 |------|------|------|
 | TradeID | 成交编号 | str |
 | InstrumentID | 合约代码 | str |
 | Direction | 方向('0'=买,'1'=卖) | str |
-| OffsetFlag | 开平('0'=开,'1'=平,'3'=平今,'4'=平昨) | str |
+| OffsetFlag | 开平('0'=开,'1'=平,'2'=强平,'3'=平今,'4'=平昨) | str |
 | Price | 成交价格 | float |
 | Volume | 成交数量 | int |
 | TradeTime | 成交时间 | str |
-| TradeDate | 成交日期 | str |
-
-**示例：**
 
 ```python
 def on_trade(data):
     direction = '买' if data['Direction'] == '0' else '卖'
-    offset = '开' if data['OffsetFlag'] == '0' else '平'
+    offset_map = {'0': '开', '1': '平', '2': '强平', '3': '平今', '4': '平昨'}
+    offset = offset_map.get(data['OffsetFlag'], '未知')
     print(f"成交: {data['InstrumentID']} {direction}{offset} "
           f"{data['Volume']}手 @{data['Price']:.2f}")
-
-runner.run(
-    strategy=my_strategy,
-    on_trade=on_trade
-)
 ```
 
 ---
 
 ### on_order(data)
 
-报单回调，当报单状态变化时触发。
-
-**参数 data 字段：**
+报单回调。
 
 | 字段 | 说明 |
 |------|------|
@@ -676,49 +711,40 @@ runner.run(
 **OrderStatus 值：**
 - `'0'`: 全部成交
 - `'1'`: 部分成交
+- `'2'`: 部分成交部分撤单
 - `'3'`: 未成交
+- `'4'`: 未成交已撤
 - `'5'`: 撤单
 
 ---
 
 ### on_cancel(data)
 
-撤单回调，当订单被撤销时触发。
-
-**示例：**
-
-```python
-def on_cancel(data):
-    symbol = data['InstrumentID']
-    print(f"撤单: {symbol}")
-    
-    # 可以在这里重新下单（追价）
-    # api.buy(volume=1, order_type='market', offset_ticks=10)
-```
+撤单回调。
 
 ---
 
 ### on_order_error(data)
 
-报单错误回调，当报单失败时触发。
+报单错误回调。
 
 ---
 
 ### on_cancel_error(data)
 
-撤单错误回调，当撤单失败时触发。
+撤单错误回调。
 
 ---
 
 ### on_account(data)
 
-账户资金回调，资金变化时触发。
+账户资金回调。
 
 ---
 
 ### on_position(data)
 
-持仓回调，持仓变化时触发。
+持仓回调。
 
 ---
 
@@ -739,23 +765,77 @@ runner.run(
 
 ---
 
+## 配置参数参考
+
+### get_config() 函数
+
+```python
+config = get_config(
+    mode,                      # RunMode.BACKTEST / SIMNOW / REAL_TRADING
+    account=None,              # 账户名（SIMNOW/实盘必填）
+    auto_params=True,          # 自动获取合约参数
+    **overrides                # 覆盖参数
+)
+```
+
+### 回测配置参数
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `symbol` | - | 合约代码（如 `'rb888'`） |
+| `start_date` | - | 开始日期 `'YYYY-MM-DD'` |
+| `end_date` | - | 结束日期 `'YYYY-MM-DD'` |
+| `start_time` | - | 精确开始时间 |
+| `end_time` | - | 精确结束时间 |
+| `limit` | - | 最近N根K线 |
+| `kline_period` | `'1h'` | K线周期 |
+| `adjust_type` | `'1'` | 复权: `'0'`/`'1'`/`'2'` |
+| `initial_capital` | `20000` | 初始资金 |
+| `commission` | `0.0001` | 手续费率 |
+| `margin_rate` | `0.1` | 保证金率 |
+| `slippage_ticks` | `1` | 滑点跳数 |
+| `lookback_bars` | `0` | 数据窗口（0=不限制） |
+| `tick_queue_maxsize` | `20000` | Tick队列容量 |
+
+### SIMNOW/实盘配置参数
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `kline_period` | `'1m'` | K线周期 |
+| `order_offset_ticks` | `5` | 超价跳数 |
+| `algo_trading` | `False` | 启用算法交易 |
+| `order_timeout` | `10` | 超时时间(秒) |
+| `retry_limit` | `3` | 最大重试次数 |
+| `retry_offset_ticks` | `5` | 重试偏移跳数 |
+| `preload_history` | `True` | 预加载历史K线 |
+| `history_lookback_bars` | `100` | 预加载数量 |
+| `kline_source` | `'local'` | `'local'` 或 `'data_server'` |
+| `enable_tick_callback` | `False` | TICK驱动模式 |
+| `tick_callback_interval` | `0.5` | 节流间隔(秒) |
+| `tick_queue_maxsize` | `20000` | Tick队列容量 |
+| `auto_roll_enabled` | `False` | 自动移仓 |
+| `auto_roll_mode` | `'simultaneous'` | 移仓模式 |
+| `auto_roll_reopen` | `True` | 是否补开新仓 |
+
+---
+
 ## 完整示例
 
-### 双均线策略（带止损）
+### 双均线策略（带止损 + 移仓感知）
 
 ```python
 from ssquant.api.strategy_api import StrategyAPI
 
-# 全局变量
 g_entry_price = 0
-g_stop_loss_pct = 0.05  # 5%止损
 
 def my_ma_strategy(api: StrategyAPI):
-    """双均线策略 + 止损"""
     global g_entry_price
     
-    close = api.get_close()
+    # 移仓进行中不交易
+    if api.is_rollover_busy():
+        return
     
+    close = api.get_close()
     if len(close) < 20:
         return
     
@@ -764,11 +844,10 @@ def my_ma_strategy(api: StrategyAPI):
     pos = api.get_pos()
     current_price = close.iloc[-1]
     
-    # 止损逻辑
+    # 止损
     if pos > 0 and g_entry_price > 0:
-        if current_price < g_entry_price * (1 - g_stop_loss_pct):
+        if current_price < g_entry_price * 0.95:
             api.sell(order_type='next_bar_open', reason='止损')
-            api.log(f"止损: {current_price:.2f} < {g_entry_price * 0.95:.2f}")
             g_entry_price = 0
             return
     
@@ -779,7 +858,6 @@ def my_ma_strategy(api: StrategyAPI):
                 api.buycover(order_type='next_bar_open')
             api.buy(volume=1, order_type='next_bar_open')
             g_entry_price = current_price
-            api.log(f"金叉开多 @{current_price:.2f}")
     
     # 死叉
     elif ma5.iloc[-2] >= ma20.iloc[-2] and ma5.iloc[-1] < ma20.iloc[-1]:
@@ -788,84 +866,8 @@ def my_ma_strategy(api: StrategyAPI):
                 api.sell(order_type='next_bar_open')
             api.sellshort(volume=1, order_type='next_bar_open')
             g_entry_price = current_price
-            api.log(f"死叉开空 @{current_price:.2f}")
-```
-
-### 多品种策略
-
-```python
-def multi_symbol_strategy(api: StrategyAPI):
-    """多品种策略"""
-    if not api.require_data_sources(2):
-        return
-    
-    for i in range(api.get_data_sources_count()):
-        close = api.get_close(index=i)
-        
-        if len(close) < 20:
-            continue
-        
-        ma20 = close.rolling(20).mean()
-        pos = api.get_pos(index=i)
-        
-        if close.iloc[-1] > ma20.iloc[-1] and pos <= 0:
-            if pos < 0:
-                api.buycover(order_type='next_bar_open', index=i)
-            api.buy(volume=1, order_type='next_bar_open', index=i)
-        
-        elif close.iloc[-1] < ma20.iloc[-1] and pos >= 0:
-            if pos > 0:
-                api.sell(order_type='next_bar_open', index=i)
-            api.sellshort(volume=1, order_type='next_bar_open', index=i)
 ```
 
 ---
 
-## 最佳实践
-
-### 1. 数据验证
-
-```python
-def my_strategy(api):
-    # 检查索引
-    if api.get_idx() < 20:
-        return
-    
-    close = api.get_close()
-    
-    # 检查长度
-    if len(close) < 20:
-        return
-    
-    # 继续策略逻辑...
-```
-
-### 2. 安全的持仓操作
-
-```python
-def safe_strategy(api):
-    pos = api.get_pos()
-    
-    # 开仓前先平掉反向持仓
-    if buy_signal and pos <= 0:
-        if pos < 0:
-            api.buycover(order_type='next_bar_open')
-        api.buy(volume=1, order_type='next_bar_open')
-```
-
-### 3. 日志调试
-
-```python
-def debug_strategy(api):
-    close = api.get_close()
-    pos = api.get_pos()
-    idx = api.get_idx()
-    
-    # 定期打印状态
-    if idx % 100 == 0:
-        api.log(f"Bar {idx}: 价格={close.iloc[-1]:.2f}, 持仓={pos}")
-```
-
----
-
-查看更多示例：`examples/` 目录
+查看更多示例：`examples/` 目录（共 25 个）

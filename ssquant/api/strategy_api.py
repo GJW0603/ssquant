@@ -19,6 +19,8 @@ class StrategyAPI:
         self._params = context.get('params', {})
         self._account_info = context.get('account_info', None)  # 账户信息引用
         self._ctp_client = context.get('ctp_client', None)      # CTP客户端引用
+        self._runtime_state_getter = context.get('runtime_state_getter', None)
+        self._rollover_status_getter = context.get('rollover_status_getter', None)
         
     def log(self, message: str):
         """
@@ -50,6 +52,56 @@ class StrategyAPI:
             参数值，如果不存在则返回默认值
         """
         return self._params.get(key, default)
+
+    def get_runtime_stats(self) -> Dict[str, Any]:
+        """
+        获取运行时状态快照（队列积压、处理耗时、压力等级等）。
+        """
+        if callable(self._runtime_state_getter):
+            try:
+                return self._runtime_state_getter() or {}
+            except Exception:
+                return {}
+        return {}
+
+    def get_runtime_pressure(self) -> str:
+        """
+        获取运行时压力等级：normal / busy / critical
+        """
+        return str(self.get_runtime_stats().get('pressure_level', 'normal'))
+
+    def get_rollover_status(self) -> Dict[str, Any]:
+        """
+        获取框架自动换月（移仓）状态快照（仅实盘/SIMNOW 且已启用引擎时有效）。
+
+        返回结构示例：``{'per_source': {'0': { ... }}}``。每项可含：
+        ``sent_for``、``expected_vol``、``expected_dir``、``wait_invocations``、
+        ``seq_phase``（``''`` / ``wait_close`` / ``wait_open``，仅 sequential 模式有阶段）。
+        """
+        if callable(self._rollover_status_getter):
+            try:
+                return self._rollover_status_getter() or {}
+            except Exception:
+                return {}
+        return {}
+
+    def is_rollover_busy(self, index: int = 0) -> bool:
+        """
+        当前数据源是否处于移仓等待闭环（已发移仓单、尚未确认完成）。
+
+        依据 ``sent_for`` 非空；含 sequential 下「仅平旧已发」或「已发开新待成交」等阶段。
+        """
+        per = self.get_rollover_status().get('per_source', {})
+        st = per.get(str(index), {})
+        return bool(st.get('sent_for'))
+
+    def is_runtime_under_pressure(self, level: str = 'busy') -> bool:
+        """
+        判断当前是否达到指定压力等级及以上。
+        """
+        order = {'normal': 0, 'busy': 1, 'critical': 2}
+        current = self.get_runtime_pressure()
+        return order.get(current, 0) >= order.get(level, 1)
     
     def get_data_source(self, index: int = 0):
         """
@@ -146,7 +198,11 @@ class StrategyAPI:
     
     def get_price(self, index: int = 0) -> Optional[float]:
         """
-        获取当前价格
+        获取当前策略价格。
+
+        在 data_server + 本地复权场景下，该值会尽量与
+        `get_klines()` / `get_close()` 返回的价格口径一致；
+        如果需要原始未复权价格，请使用 `get_raw_price()`。
         
         Args:
             index: 数据源索引，默认为0（第一个数据源）
@@ -156,6 +212,19 @@ class StrategyAPI:
         """
         ds = self.get_data_source(index)
         if ds:
+            if hasattr(ds, 'get_strategy_price'):
+                return ds.get_strategy_price()
+            return ds.get_current_price()
+        return None
+
+    def get_raw_price(self, index: int = 0) -> Optional[float]:
+        """
+        获取原始未复权价格（更接近底层行情/委托定价口径）。
+        """
+        ds = self.get_data_source(index)
+        if ds:
+            if hasattr(ds, 'get_raw_price'):
+                return ds.get_raw_price()
             return ds.get_current_price()
         return None
     

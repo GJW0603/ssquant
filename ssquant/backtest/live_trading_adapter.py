@@ -23,6 +23,21 @@ if TYPE_CHECKING:
 
 import queue
 
+
+def _live_ds_matches_instrument_id(ds: Any, instrument_id: str) -> bool:
+    """
+    报单/撤单回报中的 InstrumentID 与数据源匹配：
+    当前主力 ds.symbol，或换月残留持仓对应的旧合约 _old_contract。
+    """
+    if not instrument_id:
+        return False
+    ins = instrument_id.upper()
+    if ds.symbol.upper() == ins:
+        return True
+    old = getattr(ds, "_old_contract", None)
+    return bool(old and str(old).upper() == ins)
+
+
 class DataRecorder:
     """数据记录器 - 实盘行情落盘（支持CSV和DB双存储，异步队列写入）"""
     
@@ -133,7 +148,7 @@ class DataRecorder:
             save_kline_db: 是否保存K线到数据库
             save_tick_csv: 是否保存TICK到CSV
             save_tick_db: 是否保存TICK到数据库
-            adjust_type: 复权类型 ('0'=不复权/raw, '1'=后复权/hfq)
+            adjust_type: 复权类型 ('0'=不复权/raw, '1'=后复权/hfq, '2'=前复权/qfq)
         """
         self.symbol = symbol
         self.kline_period = kline_period
@@ -162,21 +177,21 @@ class DataRecorder:
         
         # 根据复权类型确定K线表名后缀
         # TICK周期没有复权概念，不需要后缀
-        # 检查远程后复权开关，保持与 api_data_fetcher.py 一致
         try:
             from ..config.trading_config import ENABLE_REMOTE_ADJUST
         except ImportError:
-            ENABLE_REMOTE_ADJUST = False
+            ENABLE_REMOTE_ADJUST = True
         
-        if not ENABLE_REMOTE_ADJUST and adjust_type == '1':
-            print(f"[数据记录器] 远程服务器升级中暂不支持后复权，adjust_type 已从 '1' 强制改为 '0'")
+        if not ENABLE_REMOTE_ADJUST and adjust_type != '0':
+            print(f"[数据记录器] 本地复权已禁用，adjust_type 已从 '{adjust_type}' 强制改为 '0'")
             adjust_type = '0'
-            self.adjust_type = '0'  # 同步更新实例属性
+            self.adjust_type = '0'
         
         if kline_period.lower() == 'tick':
             self.kline_suffix = None  # TICK模式不保存K线到DB
         else:
-            self.kline_suffix = 'hfq' if adjust_type == '1' else 'raw'
+            from ..data.local_adjust import get_adjust_suffix
+            self.kline_suffix = get_adjust_suffix(adjust_type)
         
         # 初始化后台写入线程（所有记录器共用）
         if save_kline_csv or save_kline_db or save_tick_csv or save_tick_db:
@@ -332,10 +347,10 @@ class LiveDataSource:
         # 未成交订单跟踪
         self.pending_orders = {}  # {OrderSysID: order_data}
         
-        # 历史数据预加载
+        # 历史数据预加载（默认延迟到 _init_data_source 中并行执行）
         # data_server 模式：历史数据通过 WebSocket preload 获取，不走本地预加载
-        if config.get('preload_history', False) and self.kline_source != 'data_server':
-            self._preload_historical_data(config)
+        self._need_preload = config.get('preload_history', False) and self.kline_source != 'data_server'
+        self._preload_config = config
     
     def _preload_historical_data(self, config: Dict):
         """预加载历史数据（支持K线和TICK两种模式）"""
@@ -351,18 +366,16 @@ class LiveDataSource:
             return
         
         # K线周期：预加载历史K线数据
-        # 获取K线数量配置（默认100根）
         lookback_bars = config.get('history_lookback_bars', 100)
         adjust_type = config.get('adjust_type', '0')
         
-        # 检查远程后复权开关，保持与 api_data_fetcher.py 一致
         try:
             from ..config.trading_config import ENABLE_REMOTE_ADJUST
         except ImportError:
-            ENABLE_REMOTE_ADJUST = False
+            ENABLE_REMOTE_ADJUST = True
         
-        if not ENABLE_REMOTE_ADJUST and adjust_type == '1':
-            print(f"[预加载] 远程服务器升级中暂不支持后复权，adjust_type 已从 '1' 强制改为 '0'")
+        if not ENABLE_REMOTE_ADJUST and adjust_type != '0':
+            print(f"[预加载] 本地复权已禁用，adjust_type 已从 '{adjust_type}' 强制改为 '0'")
             adjust_type = '0'
         
         # 用户自定义历史数据符号（如 rb888 主力或 rb777 次主力）
@@ -442,11 +455,17 @@ class LiveDataSource:
             print(f"[LiveDataSource]       可通过 save_tick_db=True 采集TICK数据\n")
     
     def _check_order_timeout(self):
-        """检查订单超时（智能算法交易）"""
+        """检查订单超时（智能算法交易），节流为每秒最多检查一次"""
         if not self.algo_trading or self.order_timeout <= 0:
             return
         
         current_time = time.time()
+        
+        # 节流：每秒最多检查一次，避免每个 tick 都遍历 pending_orders
+        last_check = getattr(self, '_last_timeout_check', 0)
+        if current_time - last_check < 1.0:
+            return
+        self._last_timeout_check = current_time
         
         # 遍历所有未成交订单
         # 注意：需要拷贝items()，因为循环中可能删除字典元素
@@ -484,11 +503,13 @@ class LiveDataSource:
                 # 发送撤单请求
                 exchange_id = order.get('ExchangeID', '')
                 if not exchange_id:
-                    # 智能推导交易所代码（兜底，正常情况 CTP 回报中已包含 ExchangeID）
+                    # 撤单必须使用订单上的合约代码（换月平旧时为旧合约，不能用 ds.symbol）
                     from ..pyctp.trader_api import _get_exchange_id
-                    exchange_id = _get_exchange_id(self.symbol) or 'SHFE'
+                    inst = order.get("InstrumentID") or self.symbol
+                    exchange_id = _get_exchange_id(inst) or "SHFE"
                 if self.ctp_client:
-                    self.ctp_client.cancel_order(self.symbol, order_sys_id, exchange_id)
+                    inst = order.get("InstrumentID") or self.symbol
+                    self.ctp_client.cancel_order(inst, order_sys_id, exchange_id)
 
     def update_tick(self, tick_data: Dict) -> Dict:  # type: ignore
         """更新tick数据并聚合K线
@@ -527,26 +548,37 @@ class LiveDataSource:
             # 日盘时段，TradingDay 就是自然日
             date_str = f"{trading_day[:4]}-{trading_day[4:6]}-{trading_day[6:]}"
         elif hour >= 21:  # 21:00-23:59 夜盘前半段
-            # 使用交易日历反查上一个交易日
-            # 例如：周四晚 21:00，TradingDay=周五 → 返回周四
-            try:
-                from ..data.api_data_fetcher import get_prev_trading_day
-                date_str = get_prev_trading_day(trading_day)
-            except Exception:
-                # 回退方案：使用系统当前日期
-                date_str = dt.now().strftime('%Y-%m-%d')
+            # 使用交易日历反查上一个交易日（带缓存，避免每个 tick 重复查询）
+            cache = getattr(self, '_prev_trading_day_cache', {})
+            if trading_day in cache:
+                date_str = cache[trading_day]
+            else:
+                try:
+                    from ..data.api_data_fetcher import get_prev_trading_day
+                    date_str = get_prev_trading_day(trading_day)
+                except Exception:
+                    date_str = dt.now().strftime('%Y-%m-%d')
+                cache[trading_day] = date_str
+                self._prev_trading_day_cache = cache
         else:  # 00:00-08:59 凌晨时段（夜盘后半段 + 早盘前）
             # 凌晨夜盘（00:00-02:30）应该使用当前系统日期
             # 因为这时候已经是新的一天了
             date_str = dt.now().strftime('%Y-%m-%d')
         
         datetime_str = f"{date_str} {update_time}.{millisec:03d}"
+        
+        # data_server 模式：K线由远程推送，不需要本地聚合
+        # 跳过 pd.to_datetime 和 dict.copy（这两个是最耗时的操作）
+        # datetime 以字符串形式直接写入原始 tick_data（避免全量拷贝）
+        if self.kline_source == 'data_server':
+            tick_data['datetime'] = datetime_str
+            self.ticks.append(tick_data)
+            return None  # type: ignore
+        
         tick_datetime = pd.to_datetime(datetime_str)
         
-        # data_server 模式：current_datetime 由 on_ws_kline 管理（K线整分钟时间）
-        # 本地模式：current_datetime 由 tick 驱动
-        if self.kline_source != 'data_server':
-            self.current_datetime = tick_datetime
+        # data_server 模式已在上方提前返回，此处仅 local 模式
+        self.current_datetime = tick_datetime
         
         # 保存完整的CTP原始数据，只添加datetime字段
         tick_info = tick_data.copy()
@@ -554,15 +586,26 @@ class LiveDataSource:
         
         self.ticks.append(tick_info)
         
-        # data_server 模式：不做本地K线聚合，K线由远程推送
-        if self.kline_source == 'data_server':
-            return None  # type: ignore
-        
         # 本地模式：聚合K线并返回完成的K线
         return self._aggregate_kline(tick_data)
     
     def get_current_price(self) -> float:
-        """获取当前价格"""
+        """获取当前原始价格（用于委托定价/最新行情）。"""
+        return self.current_price
+
+    def get_strategy_price(self) -> float:
+        """获取策略视角价格，尽量与 get_klines()/get_close() 所见口径一致。"""
+        adjust_type = str(self.config.get('adjust_type', '0') or '0')
+        if self.kline_source == 'data_server' and adjust_type != '0':
+            df = self.get_klines(window=1)
+            if not df.empty and 'close' in df.columns:
+                price = df.iloc[-1].get('close')
+                if pd.notna(price):
+                    return float(price)
+        return self.current_price
+
+    def get_raw_price(self) -> float:
+        """显式返回原始价格，避免与复权后的策略价格混用。"""
         return self.current_price
     
     def get_current_datetime(self):
@@ -665,6 +708,7 @@ class LiveDataSource:
             self.current_kline = {
                 'datetime': kline_time,
                 'symbol': self.symbol,  # 具体合约代码
+                'real_symbol': self.symbol,  # 保留实际合约，供本地复权识别换月点
                 'open': self.current_price,
                 'high': self.current_price,
                 'low': self.current_price,
@@ -713,12 +757,31 @@ class LiveDataSource:
             return pd.DataFrame()
         
         klines_list = list(self.klines)
+        df = pd.DataFrame(klines_list)
+        
+        # data_server 模式统一缓存 raw 数据，对外读取时按 adjust_type 本地复权
+        adjust_type = str(self.config.get('adjust_type', '0') or '0')
+        if self.kline_source == 'data_server' and adjust_type != '0':
+            try:
+                from ..config.trading_config import ENABLE_REMOTE_ADJUST
+            except ImportError:
+                ENABLE_REMOTE_ADJUST = True
+            if ENABLE_REMOTE_ADJUST:
+                from ..data.local_adjust import apply_local_adjust
+                df = apply_local_adjust(df, self.symbol, self.kline_period, adjust_type)
         
         # 如果指定了窗口大小且大于0，只返回最近的window条
         if window is not None and window > 0:
-            klines_list = klines_list[-window:]
+            df = df.iloc[-window:]
         
-        return pd.DataFrame(klines_list)
+        return df
+
+    def get_latest_kline_record(self) -> Optional[Dict]:
+        """返回最新一根K线，供数据记录器保存。"""
+        df = self.get_klines(window=1)
+        if df.empty:
+            return None
+        return df.iloc[-1].to_dict()
     
     def get_close(self) -> pd.Series:
         """获取收盘价序列"""
@@ -1286,16 +1349,17 @@ class LiveDataSource:
         cancel_count = 0
         for order in list(self.pending_orders.values()):
             if order.get('OrderSysID') and order.get('OrderStatus') in ['1', '3', 'a']:  # 部分成交/未成交/未知
+                inst = order.get("InstrumentID") or self.symbol
                 # 从订单数据中获取交易所代码
                 exchange_id = order.get('ExchangeID', '')
                 if not exchange_id:
                     from ..pyctp.trader_api import _get_exchange_id
-                    exchange_id = _get_exchange_id(self.symbol) or 'SHFE'
+                    exchange_id = _get_exchange_id(inst) or 'SHFE'
                 
                 if log_callback:
-                    log_callback(f"[撤单] {self.symbol} 订单号={order['OrderSysID']} 交易所={exchange_id}")
+                    log_callback(f"[撤单] {inst} 订单号={order['OrderSysID']} 交易所={exchange_id}")
                 
-                self.ctp_client.cancel_order(self.symbol, order['OrderSysID'], exchange_id)
+                self.ctp_client.cancel_order(inst, order['OrderSysID'], exchange_id)
                 cancel_count += 1
         
         if cancel_count > 0 and log_callback:
@@ -1440,6 +1504,7 @@ class LiveTradingAdapter:
                     symbol = ds_config['symbol']
                     kline_period = ds_config.get('kline_period', '1m')
                     adjust_type = ds_config.get('adjust_type', '0')
+                    recorder_adjust_type = '0'
                     
                     # 键: symbol_period，支持同品种多周期
                     recorder_key = f"{symbol}_{kline_period}"
@@ -1452,13 +1517,14 @@ class LiveTradingAdapter:
                         save_kline_db=save_kline_db,
                         save_tick_csv=save_tick_csv,
                         save_tick_db=save_tick_db,
-                        adjust_type=adjust_type,
+                        adjust_type=recorder_adjust_type,
                     )
             else:
                 # 单数据源模式
                 symbol = config['symbol']
                 kline_period = config.get('kline_period', '1m')
                 adjust_type = config.get('adjust_type', '0')
+                recorder_adjust_type = '0'
                 
                 recorder_key = f"{symbol}_{kline_period}"
                 self.data_recorders[recorder_key] = DataRecorder(
@@ -1470,32 +1536,112 @@ class LiveTradingAdapter:
                     save_kline_db=save_kline_db,
                     save_tick_csv=save_tick_csv,
                     save_tick_db=save_tick_db,
-                    adjust_type=adjust_type,
+                    adjust_type=recorder_adjust_type,
                 )
         
         # 运行标志
         self.running = False
         self.strategy_thread = None
+        self._tick_thread_should_stop = False
         
         # TICK流支持（双驱动模式）
         self.enable_tick_callback = config.get('enable_tick_callback', False)
         
+        # ========== Tick 处理队列（解耦 CTP 线程和策略执行） ==========
+        self._tick_queue_maxsize = max(1000, int(config.get('tick_queue_maxsize', 20000)))
+        self._tick_queue_soft_limit = max(100, int(self._tick_queue_maxsize * 0.7))
+        self._tick_queue_recover_limit = max(50, int(self._tick_queue_maxsize * 0.3))
+        self._tick_queue = queue.Queue(maxsize=self._tick_queue_maxsize)
+        self._tick_thread: Optional[threading.Thread] = None
+        self._tick_queue_high_water = 0
+        self._tick_overflow_latest: Dict[str, Dict] = {}
+        self._tick_overflow_count = 0
+        self._tick_overflow_last_log = 0.0
+        self._tick_overflow_lock = threading.Lock()
+        self._runtime_state_lock = threading.Lock()
+        self._runtime_state = {
+            'pressure_level': 'normal',
+            'tick_queue_size': 0,
+            'tick_queue_maxsize': self._tick_queue_maxsize,
+            'tick_queue_high_water': 0,
+            'overflow_buffer_size': 0,
+            'overflow_total': 0,
+            'avg_process_ms': 0.0,
+            'last_process_ms': 0.0,
+            'compact_count': 0,
+            'last_update_time': None,
+        }
+        
         # ========== data_server WebSocket K线客户端 ==========
         self.ws_kline_client = None
         self._ws_subscription_map = {}  # (ws_symbol, period) -> LiveDataSource
-        self._strategy_lock = threading.Lock()  # 策略执行锁（防止CTP线程和WS线程并发调用）
+        self._strategy_lock = threading.Lock()  # 策略执行锁（防止tick线程和WS线程并发调用）
         self._kline_source = config.get('kline_source', 'local')
+        self._ws_preload_done = threading.Event()
+        self._ws_preload_expected = 0
+        self._ws_preload_received = 0
+        self._ws_preload_lock = threading.Lock()
+        
+        # data_server 模式 tick 回调节流（避免开盘 tick 洪峰导致假死）
+        self._ws_kline_arrived = threading.Event()
+        self._last_tick_strategy_ts = 0.0
+        self._tick_callback_interval = float(config.get('tick_callback_interval', 0.5))
+        
+        # 自动换月引擎（run() 内 _init_data_source 之后创建）
+        self._rollover_engine = None
         
         print(f"[实盘适配器] 初始化 - 模式: {mode}")
+        print(
+            f"[实盘适配器] Tick队列: max={self._tick_queue_maxsize}, "
+            f"soft={self._tick_queue_soft_limit}, recover={self._tick_queue_recover_limit}"
+        )
         if self._kline_source == 'data_server':
             print(f"[实盘适配器] ✓ K线数据源: data_server（远程推送模式）")
         if self.enable_tick_callback:
-            print(f"[实盘适配器] ✓ TICK流双驱动模式已启用（每个tick和K线完成时都会触发策略）")
+            if self._kline_source == 'data_server':
+                print(f"[实盘适配器] ✓ TICK流双驱动模式已启用（data_server节流: 新K线立即触发, 无K线时≤{self._tick_callback_interval}s触发一次）")
+            else:
+                print(f"[实盘适配器] ✓ TICK流双驱动模式已启用（每个tick和K线完成时都会触发策略）")
+
+    def _update_runtime_state(self, **kwargs):
+        """更新运行时状态快照，供策略层做自适应降级。"""
+        with self._runtime_state_lock:
+            self._runtime_state.update(kwargs)
+            self._runtime_state['last_update_time'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+    def _refresh_runtime_pressure(self, queue_size: Optional[int] = None):
+        """根据队列积压和处理耗时评估当前压力等级。"""
+        if queue_size is None:
+            queue_size = self._tick_queue.qsize()
+
+        with self._runtime_state_lock:
+            avg_process_ms = float(self._runtime_state.get('avg_process_ms', 0.0) or 0.0)
+            overflow_buffer_size = int(self._runtime_state.get('overflow_buffer_size', 0) or 0)
+
+        ratio = queue_size / self._tick_queue_maxsize if self._tick_queue_maxsize > 0 else 0
+        if overflow_buffer_size > 0 or ratio >= 0.85 or avg_process_ms >= 500:
+            pressure_level = 'critical'
+        elif ratio >= 0.5 or avg_process_ms >= 150:
+            pressure_level = 'busy'
+        else:
+            pressure_level = 'normal'
+
+        self._update_runtime_state(
+            pressure_level=pressure_level,
+            tick_queue_size=queue_size,
+            tick_queue_high_water=self._tick_queue_high_water,
+        )
+
+    def get_runtime_stats(self) -> Dict[str, Any]:
+        """返回运行时统计快照。"""
+        with self._runtime_state_lock:
+            return dict(self._runtime_state)
     
     def run(self) -> Dict[str, Any]:
         """运行实盘交易"""
         # ========== 鉴权检查（kanpan789 验证账号） ==========
-        from ..data.auth_manager import verify_auth, get_auth_message
+        from ..data.auth_manager import verify_auth, get_auth_message, set_effective_data_server
+        set_effective_data_server(self.config.get('data_server'))
         if not verify_auth():
             raise RuntimeError(f"鉴权失败: {get_auth_message()}")
         
@@ -1505,6 +1651,10 @@ class LiveTradingAdapter:
         # 初始化数据源
         self._init_data_source()
         
+        # 自动换月（移仓）引擎：依赖 multi_data_source 与合并后的 config
+        from .rollover_engine import RolloverEngine
+        self._rollover_engine = RolloverEngine(self)
+        
         # 创建策略API
         self._create_strategy_api()
         
@@ -1512,10 +1662,25 @@ class LiveTradingAdapter:
         if self._kline_source == 'data_server':
             self._init_ws_kline_client()
         
+        # 等待 data_server 预加载完成（在 CTP 连接前）
+        if self._kline_source == 'data_server' and self._ws_preload_expected > 0:
+            _preload_timeout = self._ws_preload_expected * 30
+            print(f"[实盘适配器] 等待 data_server 预加载完成 ({self._ws_preload_expected} 个数据源)...")
+            if self._ws_preload_done.wait(timeout=_preload_timeout):
+                print(f"[实盘适配器] ✅ data_server 预加载完成 ({self._ws_preload_received}/{self._ws_preload_expected})\n")
+            else:
+                print(f"[实盘适配器] ⚠️ data_server 预加载超时，已收到 {self._ws_preload_received}/{self._ws_preload_expected}，继续启动...\n")
+        
         # 运行策略初始化
         if self.initialize_func:
             print("[实盘适配器] 运行策略初始化...")
             self.initialize_func(self.api)
+        
+        # 启动 tick 处理线程（在 CTP 连接前，确保不遗漏早期 tick）
+        self._tick_thread_should_stop = False
+        self._tick_thread = threading.Thread(target=self._tick_processing_loop, daemon=True)
+        self._tick_thread.start()
+        print("[实盘适配器] ✓ Tick处理线程已启动（CTP线程解耦）")
         
         # 连接CTP
         print("[实盘适配器] 连接CTP服务器...")
@@ -1673,8 +1838,42 @@ class LiveTradingAdapter:
             self.data_source.ctp_client = self.ctp_client
             data_sources.append(self.data_source)
         
+        # 并行预加载历史数据（local 模式）
+        self._parallel_preload(data_sources)
+        
         # 创建多数据源容器(兼容回测API)
         self.multi_data_source = MultiDataSource(data_sources)
+    
+    def _parallel_preload(self, data_sources: list):
+        """并行预加载所有数据源的历史数据"""
+        need_preload = [ds for ds in data_sources if getattr(ds, '_need_preload', False)]
+        if not need_preload:
+            return
+        
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        
+        max_workers = min(8, len(need_preload))
+        print(f"\n[预加载] 并行加载 {len(need_preload)} 个数据源的历史数据 (线程数: {max_workers})...")
+        
+        def _do_preload(ds):
+            try:
+                ds._preload_historical_data(ds._preload_config)
+                return ds.symbol, True
+            except Exception as e:
+                print(f"[预加载] {ds.symbol} 失败: {e}")
+                return ds.symbol, False
+        
+        t0 = time.time()
+        success_count = 0
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(_do_preload, ds): ds for ds in need_preload}
+            for future in as_completed(futures):
+                symbol, ok = future.result()
+                if ok:
+                    success_count += 1
+        
+        elapsed = time.time() - t0
+        print(f"[预加载] 完成: {success_count}/{len(need_preload)} 成功，耗时 {elapsed:.1f}s\n")
     
     def _init_ws_kline_client(self):
         """初始化 data_server WebSocket K线客户端"""
@@ -1694,15 +1893,25 @@ class LiveTradingAdapter:
         # 获取 data_server 配置
         ds_config = self.config.get('data_server', {})
         ws_url = ds_config.get('ws_url', 'ws://localhost:8087')
-        preload_count = ds_config.get('preload_count', 100)
+        ws_urls = [ws_url]
+        for fb in (ds_config.get('fallback_servers') or []):
+            w = fb.get('ws_url')
+            if w:
+                ws_urls.append(w)
+        default_preload = ds_config.get('preload_count', 100)
         auto_reconnect = ds_config.get('auto_reconnect', True)
         reconnect_interval = ds_config.get('reconnect_interval', 5.0)
         
-        print(f"\n[实盘适配器] 连接 data_server: {ws_url}")
+        if len(ws_urls) > 1:
+            print(f"\n[实盘适配器] 连接 data_server（多地址轮询）:")
+            for i, u in enumerate(ws_urls):
+                print(f"  [{i + 1}] {u}")
+        else:
+            print(f"\n[实盘适配器] 连接 data_server: {ws_urls[0]}")
         
         # 创建客户端
         self.ws_kline_client = WSKlineClient(
-            ws_url=ws_url,
+            ws_urls=ws_urls,
             auto_reconnect=auto_reconnect,
             reconnect_interval=reconnect_interval,
         )
@@ -1710,6 +1919,7 @@ class LiveTradingAdapter:
         # 设置回调
         self.ws_kline_client.on_kline = self._on_ws_kline
         self.ws_kline_client.on_history = self._on_ws_history
+        self.ws_kline_client.on_auth_required = self._reauth_for_ws
         
         # 连接
         connected = self.ws_kline_client.connect(timeout=10.0)
@@ -1718,6 +1928,10 @@ class LiveTradingAdapter:
             print("[实盘适配器] ⚠️ data_server 连接超时，将在后台继续重连")
         
         # 为每个数据源订阅K线
+        self._ws_preload_expected = 0
+        self._ws_preload_received = 0
+        self._ws_preload_done.clear()
+        
         for ds in self.multi_data_source.data_sources:
             if ds.kline_source != 'data_server':
                 continue
@@ -1730,6 +1944,13 @@ class LiveTradingAdapter:
             map_key = (ws_symbol, period)
             self._ws_subscription_map[map_key] = ds
             
+            # data_server 模式：优先使用策略配置的 history_lookback_bars 作为预加载数量
+            ds_preload_cfg = getattr(ds, '_preload_config', {})
+            preload_count = ds_preload_cfg.get('history_lookback_bars', default_preload) if ds_preload_cfg.get('preload_history', False) else default_preload
+            
+            if preload_count > 0:
+                self._ws_preload_expected += 1
+            
             # 订阅
             self.ws_kline_client.subscribe_kline(
                 symbol=ws_symbol,
@@ -1739,7 +1960,19 @@ class LiveTradingAdapter:
             
             print(f"  订阅: {ws_symbol} {period} (preload={preload_count}) → 数据源 {ds.symbol}")
         
-        print(f"[实盘适配器] data_server K线订阅完成\n")
+        if self._ws_preload_expected == 0:
+            self._ws_preload_done.set()
+        
+        print(f"[实盘适配器] data_server K线订阅完成，等待预加载 {self._ws_preload_expected} 个数据源...\n")
+    
+    def _reauth_for_ws(self):
+        """WebSocket 被服务端以 4001 拒绝后，重新进行 HTTP 鉴权"""
+        from ..data.auth_manager import reset_auth, verify_auth, get_auth_message
+        reset_auth()
+        if verify_auth():
+            print("[实盘适配器] WebSocket 重新鉴权成功")
+        else:
+            print(f"[实盘适配器] WebSocket 重新鉴权失败: {get_auth_message()}")
     
     def _on_ws_kline(self, symbol: str, period: str, kline_data: Dict):
         """
@@ -1759,6 +1992,9 @@ class LiveTradingAdapter:
         
         # 仅在新K线到达时才记录+触发策略（重复K线更新返回None，跳过）
         if completed_kline:
+            # 通知 tick 处理线程有新 K 线到达（用于 data_server + tick 回调节流）
+            self._ws_kline_arrived.set()
+            
             # 记录K线数据（如果启用了数据保存）
             recorder_key = f"{ds.symbol}_{ds.kline_period}"
             if recorder_key in self.data_recorders:
@@ -1769,6 +2005,8 @@ class LiveTradingAdapter:
             if self.running and not self.enable_tick_callback:
                 try:
                     with self._strategy_lock:
+                        if getattr(self, '_rollover_engine', None):
+                            self._rollover_engine.process_before_strategy()
                         self.strategy_func(self.api)
                 except Exception as e:
                     print(f"[策略执行错误] (WS K线触发) {e}")
@@ -1788,6 +2026,12 @@ class LiveTradingAdapter:
         
         # 加载历史K线到数据源
         ds.on_ws_history(klines_list)
+        
+        # 预加载计数，全部到达后通知主线程
+        with self._ws_preload_lock:
+            self._ws_preload_received += 1
+            if self._ws_preload_received >= self._ws_preload_expected:
+                self._ws_preload_done.set()
     
     def _create_strategy_api(self):
         """创建策略API"""
@@ -1797,61 +2041,189 @@ class LiveTradingAdapter:
             'params': self.strategy_params,
             'account_info': self.account_info,  # 账户信息引用
             'ctp_client': self.ctp_client,      # CTP客户端引用
+            'runtime_state_getter': self.get_runtime_stats,
+            'rollover_status_getter': lambda: (
+                self._rollover_engine.get_status_snapshot()
+                if getattr(self, '_rollover_engine', None)
+                else {}
+            ),
         }
         
         from ..api.strategy_api import create_strategy_api
         self.api = create_strategy_api(context)
     
+    _TICK_QUEUE_OVERFLOW_LIMIT = 10000
+
+    def _stash_overflow_tick(self, data: Dict):
+        """主队列满时，仅保留每个品种的最新 tick。"""
+        symbol = data.get('InstrumentID', '') or '__UNKNOWN__'
+        with self._tick_overflow_lock:
+            self._tick_overflow_latest[symbol] = data
+            self._tick_overflow_count += 1
+            buffer_size = len(self._tick_overflow_latest)
+            overflow_total = self._tick_overflow_count
+        self._update_runtime_state(
+            overflow_buffer_size=buffer_size,
+            overflow_total=overflow_total,
+        )
+        self._refresh_runtime_pressure()
+
+        now = time.time()
+        if now - self._tick_overflow_last_log >= 5:
+            self._tick_overflow_last_log = now
+            print(
+                f"[实盘适配器] ⚠ Tick队列已满，切换为最新值缓存模式: "
+                f"累计暂存 {overflow_total} 条，当前保留 {buffer_size} 个品种最新Tick"
+            )
+
+    def _flush_overflow_ticks(self):
+        """当主队列回落后，将暂存的最新 tick 回灌。"""
+        with self._tick_overflow_lock:
+            if not self._tick_overflow_latest or self._tick_queue.qsize() > self._tick_queue_recover_limit:
+                return
+            pending = list(self._tick_overflow_latest.values())
+            self._tick_overflow_latest.clear()
+        self._update_runtime_state(overflow_buffer_size=0)
+
+        restored = 0
+        for item in pending:
+            try:
+                self._tick_queue.put_nowait(item)
+                restored += 1
+            except queue.Full:
+                self._stash_overflow_tick(item)
+                break
+
+        if restored:
+            print(f"[实盘适配器] ✓ Tick队列恢复，已回灌 {restored} 个品种的最新Tick")
+        self._refresh_runtime_pressure()
+
+    def _compact_tick_backlog(self, current_data: Dict) -> Dict:
+        """高水位时压缩积压，只保留每个品种最新 tick。"""
+        latest_by_symbol = {}
+        current_symbol = current_data.get('InstrumentID', '') or '__UNKNOWN__'
+        latest_by_symbol[current_symbol] = current_data
+        drained = 0
+
+        while True:
+            try:
+                pending = self._tick_queue.get_nowait()
+                self._tick_queue.task_done()
+                drained += 1
+                symbol = pending.get('InstrumentID', '') or '__UNKNOWN__'
+                latest_by_symbol[symbol] = pending
+            except queue.Empty:
+                break
+
+        current_data = latest_by_symbol.pop(current_symbol, current_data)
+
+        requeued = 0
+        for pending in latest_by_symbol.values():
+            try:
+                self._tick_queue.put_nowait(pending)
+                requeued += 1
+            except queue.Full:
+                self._stash_overflow_tick(pending)
+
+        print(
+            f"[实盘适配器] ⚠ Tick积压压缩: 清理 {drained} 条，仅保留 "
+            f"{requeued + 1} 个品种的最新Tick"
+        )
+        runtime_stats = self.get_runtime_stats()
+        self._update_runtime_state(compact_count=int(runtime_stats.get('compact_count', 0) or 0) + 1)
+        self._refresh_runtime_pressure()
+        return current_data
+
     def _on_market_data(self, data: Dict):
-        """行情回调 - 支持TICK流双驱动模式"""
-        # 获取合约代码
+        """CTP 行情回调 — 只入队，立即返回，不阻塞 CTP 线程"""
+        try:
+            self._tick_queue.put_nowait(data)
+        except queue.Full:
+            self._stash_overflow_tick(data)
+            return
+
+        # 队列积压监控（轻量检查，不阻塞）
+        qsize = self._tick_queue.qsize()
+        if qsize > self._tick_queue_high_water:
+            self._tick_queue_high_water = qsize
+            if qsize > 500 and (qsize // 1000) > ((qsize - 1) // 1000):
+                print(f"[实盘适配器] ⚠ Tick队列积压: {qsize}")
+        self._refresh_runtime_pressure(qsize)
+    
+    def _tick_processing_loop(self):
+        """Tick 处理线程 — 从队列消费 tick 并执行策略"""
+        print("[Tick处理线程] 启动")
+        while True:
+            self._flush_overflow_ticks()
+            try:
+                data = self._tick_queue.get(timeout=1.0)
+            except queue.Empty:
+                if self._tick_thread_should_stop and self._tick_queue.empty():
+                    break
+                continue
+
+            qsize = self._tick_queue.qsize()
+            if qsize >= self._tick_queue_soft_limit:
+                data = self._compact_tick_backlog(data)
+
+            try:
+                start_ts = time.perf_counter()
+                self._process_tick_data(data)
+                elapsed_ms = (time.perf_counter() - start_ts) * 1000
+                runtime_stats = self.get_runtime_stats()
+                prev_avg = float(runtime_stats.get('avg_process_ms', 0.0) or 0.0)
+                avg_process_ms = elapsed_ms if prev_avg <= 0 else prev_avg * 0.9 + elapsed_ms * 0.1
+                self._update_runtime_state(
+                    last_process_ms=round(elapsed_ms, 2),
+                    avg_process_ms=round(avg_process_ms, 2),
+                )
+                self._refresh_runtime_pressure()
+            except Exception as e:
+                print(f"[Tick处理线程] 处理异常: {e}")
+                import traceback
+                traceback.print_exc()
+            finally:
+                self._tick_queue.task_done()
+        
+        print("[Tick处理线程] 停止")
+    
+    def _process_tick_data(self, data: Dict):
+        """处理单个 tick 数据（原 _on_market_data 的完整逻辑）"""
         symbol = data.get('InstrumentID', '')
         
-        # 找到对应的数据源并更新（同一品种可能有多个周期的数据源）
         completed_kline = None
         target_data_source = None
-        completed_klines = []  # 存储所有周期完成的K线
+        completed_klines = []
         
         for ds in self.multi_data_source.data_sources:
-            # 使用大小写不敏感的匹配（CTP返回的合约代码可能与订阅时大小写不同）
             if ds.symbol.upper() == symbol.upper():
                 kline = ds.update_tick(data)
-                # 记录每个周期完成的K线（用于数据保存）
                 if kline is not None:
                     completed_klines.append((ds, kline))
-                    # 记录第一个完成K线的数据源（用于触发策略）
                     if completed_kline is None:
                         completed_kline = kline
                         target_data_source = ds
                 elif target_data_source is None:
                     target_data_source = ds
-                # 不break，继续更新同品种的其他周期数据源
         
-        # 【关键修复】保存当前TICK数据，让策略能通过 api.get_tick() 获取
-        # 在多数据源模式下，这样可以获取到"触发策略的那个TICK"
         if target_data_source:
             self.multi_data_source._current_tick = data
             self.multi_data_source._current_tick_symbol = symbol
         
         # 记录数据
         if target_data_source:
-            # TICK记录：同一品种只用第一个记录器记录（避免多周期重复）
-            # 初始化品种->记录器的映射（只在第一次时建立，大小写不敏感）
             if not hasattr(self, '_symbol_tick_recorder'):
                 self._symbol_tick_recorder = {}
                 for key, recorder in self.data_recorders.items():
-                    sym = key.rsplit('_', 1)[0]  # 从 rb2601_1m 提取 rb2601
+                    sym = key.rsplit('_', 1)[0]
                     sym_upper = sym.upper()
                     if sym_upper not in self._symbol_tick_recorder:
                         self._symbol_tick_recorder[sym_upper] = recorder
             
-            # 用该品种对应的记录器记录 TICK（大小写不敏感）
             symbol_upper = symbol.upper()
             if symbol_upper in self._symbol_tick_recorder:
                 self._symbol_tick_recorder[symbol_upper].record_tick(data)
             
-            # K线记录：每个周期独立记录（修复：记录所有周期完成的K线）
-            # 使用数据源自身的 symbol（保持原始大小写）
             for ds, kline in completed_klines:
                 recorder_key = f"{ds.symbol}_{ds.kline_period}"
                 if recorder_key in self.data_recorders:
@@ -1860,18 +2232,37 @@ class LiveTradingAdapter:
         if not self.running:
             return
         
-        # 双驱动模式：TICK流 + K线完成
+        # ========== data_server + tick回调 节流 ==========
+        # 当 kline_source='data_server' 且 enable_tick_callback=True 时，
+        # 策略仅需在新K线到达或定时间隔触发，无需每个tick都调用。
+        # 避免开盘tick洪峰（34品种同时推送）导致队列积压/假死。
+        if self.enable_tick_callback and self._kline_source == 'data_server':
+            now_mono = time.monotonic()
+            ws_arrived = self._ws_kline_arrived.is_set()
+            if ws_arrived:
+                self._ws_kline_arrived.clear()
+            
+            qsize = self._tick_queue.qsize()
+            throttle = max(self._tick_callback_interval, 2.0) if qsize > 500 else self._tick_callback_interval
+            elapsed = now_mono - self._last_tick_strategy_ts
+            
+            if not ws_arrived and elapsed < throttle:
+                if hasattr(self.multi_data_source, '_current_tick'):
+                    delattr(self.multi_data_source, '_current_tick')
+                if hasattr(self.multi_data_source, '_current_tick_symbol'):
+                    delattr(self.multi_data_source, '_current_tick_symbol')
+                return
+            
+            self._last_tick_strategy_ts = now_mono
+        
         try:
             with self._strategy_lock:
-                # 1. TICK级回调（如果启用）
+                if getattr(self, '_rollover_engine', None):
+                    self._rollover_engine.process_before_strategy()
                 if self.enable_tick_callback:
-                    # 每个tick都执行策略（高频模式）
                     self.strategy_func(self.api)
                 
-                # 2. K线完成时回调（仅本地聚合模式触发）
-                # data_server 模式：completed_kline 始终为 None，K线由 _on_ws_kline 触发
                 if completed_kline is not None:
-                    # 如果没有启用TICK流，则在K线完成时执行策略
                     if not self.enable_tick_callback:
                         self.strategy_func(self.api)
         except Exception as e:
@@ -1879,7 +2270,6 @@ class LiveTradingAdapter:
             import traceback
             traceback.print_exc()
         finally:
-            # 【清理】策略执行完成后，清除当前TICK引用
             if hasattr(self.multi_data_source, '_current_tick'):
                 delattr(self.multi_data_source, '_current_tick')
             if hasattr(self.multi_data_source, '_current_tick_symbol'):
@@ -1895,6 +2285,7 @@ class LiveTradingAdapter:
         offset_map = {
             '0': '开仓',
             '1': '平仓',
+            '2': '强平',
             '3': '平今',
             '4': '平昨',
         }
@@ -1982,7 +2373,7 @@ class LiveTradingAdapter:
                         ds.long_pos = max(0, ds.long_pos - volume)
                         ds.long_yd = max(0, ds.long_yd - volume)
                         
-                elif offset_flag == '1':  # 平仓（需要判断是今仓还是昨仓）
+                elif offset_flag in ('1', '2'):  # 平仓/强平（需要判断是今仓还是昨仓）
                     # 更新净持仓
                     if direction_flag == '0':  # 买平
                         ds.current_pos += volume
@@ -2112,16 +2503,17 @@ class LiveTradingAdapter:
         order_sys_id = data.get('OrderSysID', '')
         order_status = data['OrderStatus']
         
-        # 找到对应的数据源并更新pending_orders（大小写不敏感匹配）
+        # 找到对应的数据源并更新pending_orders（主力合约或换月旧合约 _old_contract）
         for ds in self.multi_data_source.data_sources:
-            if ds.symbol.upper() == symbol.upper():
+            if _live_ds_matches_instrument_id(ds, symbol):
                 if order_sys_id:
-                    # 如果订单全部成交或撤单，从pending_orders中删除
-                    if order_status in ['0', '5']:  # 全部成交或撤单
+                    # 终态订单：从 pending_orders 中移除
+                    # '0'=全部成交, '2'=部分成交不在队列(已撤余量), '4'=未成交不在队列(已撤), '5'=全部撤单
+                    if order_status in ['0', '2', '4', '5']:
                         if order_sys_id in ds.pending_orders:
                             del ds.pending_orders[order_sys_id]
-                    # 如果是部分成交或未成交，添加/更新到pending_orders
-                    elif order_status in ['1', '3', 'a']:  # 部分成交/未成交/未知
+                    # 活跃订单：添加/更新到 pending_orders
+                    elif order_status in ['1', '3', 'a']:
                         # 只有当订单不在列表中时才添加本地时间戳（避免更新时覆盖）
                         if order_sys_id not in ds.pending_orders:
                             data['_local_insert_time'] = time.time()
@@ -2186,9 +2578,9 @@ class LiveTradingAdapter:
         print(f"\n🚫 [撤单成功] {time_str} {symbol} {direction}{offset} "
               f"价格={price:.2f} 数量={volume_original} 已成交={volume_traded} 订单号={order_sys_id}")
         
-        # 智能追单逻辑（大小写不敏感匹配）
+        # 智能追单逻辑（主力或旧合约 InstrumentID 与数据源匹配）
         for ds in self.multi_data_source.data_sources:
-            if ds.symbol.upper() == symbol.upper() and order_sys_id in ds.orders_to_resend:
+            if _live_ds_matches_instrument_id(ds, symbol) and order_sys_id in ds.orders_to_resend:
                 retry_count = ds.orders_to_resend.pop(order_sys_id)
                 
                 if retry_count < ds.retry_limit:
@@ -2239,38 +2631,37 @@ class LiveTradingAdapter:
         
         注意：CTP 返回的是持仓明细，同一合约可能有多条记录（不同开仓日期）
         需要累加所有 Position > 0 的记录，忽略 Position = 0 的记录
+        
+        修复：使用 _position_seen_keys 跟踪当前查询周期已见过的 key，
+        每个 key 首次出现时先清理旧数据再写入，防止部分查询时重复累加。
         """
         symbol = data['InstrumentID']
         posi_direction = data['PosiDirection']
         position = data.get('Position', 0)
         today_pos = data.get('TodayPosition', 0)
-        # 【关键修复】上海期货交易所(SHFE)和能源交易中心(INE)的YdPosition字段不可靠
-        # 正确的昨仓计算方式：昨仓 = 总持仓 - 今仓
-        # 这样无论哪个交易所都能正确计算昨仓
-        yd_pos = position - today_pos  # 不再使用 data.get('YdPosition', 0)
+        yd_pos = position - today_pos
         
-        # 更新持仓到适配器级别的字典（按symbol+direction作为键）
         if not hasattr(self, '_position_cache'):
-            self._position_cache = {}  # {(symbol, direction): {position, today, yd}}
+            self._position_cache = {}
+        if not hasattr(self, '_position_seen_keys'):
+            self._position_seen_keys = set()
         
         cache_key = (symbol, posi_direction)
         
-        # 使用累加模式：CTP 返回的是持仓明细，同一合约可能有多条记录
-        # Position > 0 的记录需要累加，Position = 0 的记录忽略（不删除已有数据）
         if position > 0:
-            if cache_key in self._position_cache:
-                # 累加到已有数据
-                self._position_cache[cache_key]['position'] += position
-                self._position_cache[cache_key]['today'] += today_pos
-                self._position_cache[cache_key]['yd'] += yd_pos
-            else:
-                # 新建记录
+            if cache_key not in self._position_seen_keys:
+                # 当前查询周期首次见到此 key → 清理旧数据后写入（防止部分查询累加翻倍）
                 self._position_cache[cache_key] = {
                     'position': position,
                     'today': today_pos,
                     'yd': yd_pos
                 }
-        # Position=0 的记录直接忽略，不删除已有数据
+                self._position_seen_keys.add(cache_key)
+            else:
+                # 同一查询周期的后续记录 → 正常累加（CTP 同一合约可能分多条返回）
+                self._position_cache[cache_key]['position'] += position
+                self._position_cache[cache_key]['today'] += today_pos
+                self._position_cache[cache_key]['yd'] += yd_pos
         
         # 调用用户自定义的持仓回调
         if self.on_position_callback:
@@ -2302,8 +2693,10 @@ class LiveTradingAdapter:
         if self._position_query_complete_count < expected_count:
             return
         
-        # 重置计数器
+        # 重置计数器和查询周期跟踪
         self._position_query_complete_count = 0
+        if hasattr(self, '_position_seen_keys'):
+            self._position_seen_keys.clear()
         
         # 从适配器级别的缓存中提取持仓数据
         # _position_cache: {(symbol, direction): {position, today, yd}}
@@ -2543,6 +2936,12 @@ class LiveTradingAdapter:
         """停止运行"""
         print("\n[实盘适配器] 停止运行...")
         self.running = False
+        self._tick_thread_should_stop = True
+        
+        # 等待 tick 处理线程消费完剩余 tick
+        if self._tick_thread and self._tick_thread.is_alive():
+            print("[实盘适配器] 等待Tick处理线程结束...")
+            self._tick_thread.join(timeout=5)
         
         # 关闭 data_server WebSocket 客户端
         if self.ws_kline_client:
@@ -2564,6 +2963,12 @@ class LiveTradingAdapter:
         
         # 停止后台写入线程
         DataRecorder.stop_write_thread()
+        
+        if getattr(self, '_rollover_engine', None) and hasattr(self._rollover_engine, '_audit'):
+            try:
+                self._rollover_engine._audit.close()
+            except Exception:
+                pass
         
         # 释放CTP资源
         if self.ctp_client:

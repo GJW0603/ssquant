@@ -466,7 +466,7 @@ def get_futures_data(
         username (str): API用户名/手机号
         password (str): API密码
         kline_period (str): K线周期，支持分钟(1M,5M等)、天(1D)、周(1W)、月(1Y)
-        adjust_type (str): 复权类型，0(不复权)或1(后复权)
+        adjust_type (str): 复权类型，0(不复权)、1(后复权)或2(前复权)
         depth (str): 是否获取交易数据统计，"yes"或"no"
         use_cache (bool): 是否使用缓存数据
         cache_dir (str): 缓存目录
@@ -478,16 +478,16 @@ def get_futures_data(
     Returns:
         pd.DataFrame: 包含OHLCV数据的DataFrame
     """
-    # ========== 远程后复权开关控制 ==========
-    # 根据 trading_config.py 的 ENABLE_REMOTE_ADJUST 配置决定是否允许后复权
-    # 服务器升级期间设为 False，恢复后改为 True 即可
+    # ========== 本地复权开关控制 ==========
+    # ENABLE_REMOTE_ADJUST=True 时允许本地复权 (ssquant/data/local_adjust.py)
+    # adjust_type: '0'=不复权, '1'=后复权, '2'=前复权
     try:
         from ..config.trading_config import ENABLE_REMOTE_ADJUST
     except ImportError:
-        ENABLE_REMOTE_ADJUST = False  # 导入失败时默认禁用
+        ENABLE_REMOTE_ADJUST = True
     
     if not ENABLE_REMOTE_ADJUST and adjust_type != '0':
-        print(f"[注意] 远程服务器升级中暂不支持后复权，adjust_type 已从 '{adjust_type}' 强制改为 '0'")
+        print(f"[注意] 本地复权已禁用 (ENABLE_REMOTE_ADJUST=False)，adjust_type 已从 '{adjust_type}' 强制改为 '0'")
         adjust_type = '0'
     
     # ========== TICK数据特殊处理 ==========
@@ -618,7 +618,8 @@ def get_futures_data(
         raise ValueError("必须提供 start_date/end_date、start_time/end_time 或 limit 中的至少一个")
     
     print("="*80)
-    print(f"【数据请求开始】{symbol} {kline_period} {'后复权' if adjust_type == '1' else '不复权'}")
+    from .local_adjust import get_adjust_label
+    print(f"【数据请求开始】{symbol} {kline_period} {get_adjust_label(adjust_type)}")
     print("="*80)
     
     # ========== 模式C: 仅按数量获取 ==========
@@ -728,7 +729,17 @@ def get_futures_data(
         if os.path.exists(db_path):
             print(f"使用缓存数据: {db_path}")
             try:
-                data = read_from_sqlite(db_path, table_name)
+                used_raw_cache_fallback = False
+                try:
+                    data = read_from_sqlite(db_path, table_name)
+                except Exception:
+                    if str(adjust_type) == '2':
+                        _, raw_table_name = get_cache_db_and_table(symbol, kline_period, cache_dir, '0')
+                        print(f"qfq缓存不可用，尝试回退到 raw 缓存: {raw_table_name}")
+                        data = read_from_sqlite(db_path, raw_table_name)
+                        used_raw_cache_fallback = True
+                    else:
+                        raise
                 
                 # 检查数据是否为空
                 if data is None or data.empty:
@@ -736,6 +747,9 @@ def get_futures_data(
                     raise ValueError("缓存数据为空")
                 
                 data['datetime'] = pd.to_datetime(data['datetime'])
+                if used_raw_cache_fallback:
+                    from .local_adjust import apply_local_adjust
+                    data = apply_local_adjust(data, symbol, kline_period, adjust_type)
                 
                 # 确保时区一致性 - 将所有时间戳转换为无时区
                 if isinstance(data['datetime'].dtype, pd.DatetimeTZDtype):
@@ -1102,20 +1116,21 @@ def _try_data_server_api(symbol, start_date=None, end_date=None, kline_period='1
         elif 'start_time' not in params and 'start_date' not in params:
             params['limit'] = 5000
             desc = "(limit=5000 default)"
-        
-        resp = requests.get(url, params=params, timeout=(5, 30))
+
+        resp = requests.get(url, params=params, timeout=(20, 180))
         if resp.status_code != 200:
             return None
-        
+
         result = resp.json()
         if result.get('code') != 0:
             return None
-        
+
         data_obj = result.get('data', {})
         records = data_obj.get('klines', []) if isinstance(data_obj, dict) else data_obj
+
         if not records:
             return None
-        
+
         df = pd.DataFrame(records)
         
         if df.empty or 'datetime' not in df.columns:
@@ -1185,7 +1200,8 @@ def get_cache_db_and_table(symbol, kline_period, cache_dir, adjust_type):
     if kline_period.lower() == 'tick':
         table_name = f"{symbol}_tick"
     else:
-        table_name = f"{symbol}_{kline_period}_{'hfq' if adjust_type == '1' else 'raw'}"
+        from .local_adjust import get_adjust_suffix
+        table_name = f"{symbol}_{kline_period}_{get_adjust_suffix(adjust_type)}"
     
     return db_path, table_name
 
@@ -1216,6 +1232,7 @@ def save_to_sqlite(data, db_path, table_name):
     
     # 获取数据库写入锁（确保同一数据库的写入是串行的）
     db_lock = _get_db_lock(db_path)
+    replace_all = table_name.lower().endswith('_qfq')
     
     with db_lock:  # 加锁
         conn = None
@@ -1377,6 +1394,7 @@ def append_to_sqlite(data, db_path, table_name):
     
     # 获取数据库写入锁（确保同一数据库的写入是串行的）
     db_lock = _get_db_lock(db_path)
+    replace_all = table_name.lower().endswith('_qfq')
     
     with db_lock:  # 加锁
         try:
@@ -1436,6 +1454,12 @@ def append_to_sqlite(data, db_path, table_name):
                         except Exception as e:
                             pass  # 列可能已存在
                     conn.commit()
+
+                if replace_all:
+                    cursor.execute(f'DELETE FROM "{table_name}"')
+                    new_records = _insert_dataframe(cursor, table_name, data)
+                    conn.commit()
+                    return
                 
                 # 表存在，读取已有数据进行去重
                 try:

@@ -322,6 +322,12 @@ def aggregate_1m_to_period(df_1m, target_period: str):
     if 'cumulative_openint' in df.columns:
         agg_dict['cumulative_openint'] = 'last'
 
+    # 保留合约标识，供本地复权和调试使用
+    if 'symbol' in df.columns:
+        agg_dict['symbol'] = 'last'
+    if 'real_symbol' in df.columns:
+        agg_dict['real_symbol'] = 'last'
+
     # 深度数据
     if 'open_bidp' in df.columns:
         agg_dict['open_bidp'] = 'first'

@@ -8,6 +8,21 @@
 - Windows上 WaitForMultipleObjects 最多支持63个句柄
 - 因此并行进程数设置为4，避免超出限制
 - 如在Linux/Mac平台运行，可将 n_jobs 设置为 -1 使用所有核心
+
+本文件仅做回测参数优化，不涉及 SIMNOW/实盘；实盘请用 B_多品种多周期交易策略.py。
+
+合约代码 symbol 怎么填：
+  回测：品种+888 = 主力连续合约，用于拉取连续K线（如 au888、rb888）
+  SIMNOW / 实盘（自动主力映射）：
+    au888  → 自动映射为当前主力月份（如 au888→au2508），用于CTP订阅和下单
+    au777  → 自动映射为次主力月份
+    au2508 → 指定月份，直接使用，不做映射
+
+自动移仓（仅 SIMNOW/实盘）：持仓过主力换月时，开启 auto_roll_enabled=True 即可自动平旧开新
+合约参数（乘数、最小变动价、手续费等）自动获取，无需手动填写
+复权 adjust_type：'0'=不复权  '1'=后复权  '2'=前复权
+K线来源 kline_source（仅 SIMNOW/实盘）：'local'=本地CTP Tick合成（默认）  'data_server'=远程推送
+账户配置：在 trading_config.py 的 ACCOUNTS 中填写CTP账号信息
 """
 
 from ssquant.backtest.backtest_core import MultiSourceBacktester
@@ -43,7 +58,7 @@ if __name__ == "__main__":
     
     # 添加数据源0配置 - 焦炭主力，添加两个不同周期
     backtester.add_symbol_config(
-        symbol='j888', 
+        symbol='j888',   # 品种+888 = 主力连续合约（回测时用于拉取连续K线）
         config={  # 焦炭配置
             'start_date': '2025-12-01',      # 回测开始日期
             'end_date': '2026-01-31',        # 回测结束日期
@@ -52,14 +67,14 @@ if __name__ == "__main__":
             'margin_rate': 0.1,              # 保证金率，例如：0.1表示10%
             'contract_multiplier': 100,      # 合约乘数，焦炭100吨/手
             'periods': [                     # 周期配置
-                {'kline_period': '1m', 'adjust_type': '1'},  # 1分钟周期，后复权
-                {'kline_period': '5m', 'adjust_type': '1'},  # 5分钟周期，后复权
+                {'kline_period': '1m', 'adjust_type': '1'},  # 复权: '0'不复权  '1'后复权  '2'前复权
+                {'kline_period': '5m', 'adjust_type': '1'},  # 同上
             ]
     })
     
     # 添加数据源1配置 - 焦煤主力，添加两个不同周期
     backtester.add_symbol_config(
-        symbol='jm888', 
+        symbol='jm888',  # 品种+888 = 主力连续合约（回测时用于拉取连续K线）
         config={  # 焦煤配置
             'start_date': '2025-12-01',      # 回测开始日期
             'end_date': '2026-01-31',        # 回测结束日期
@@ -68,8 +83,8 @@ if __name__ == "__main__":
             'margin_rate': 0.1,              # 保证金率
             'contract_multiplier': 60,       # 合约乘数，焦煤60吨/手
             'periods': [                     # 周期配置
-                {'kline_period': '1m', 'adjust_type': '1'},  # 1分钟周期，后复权
-                {'kline_period': '5m', 'adjust_type': '1'},  # 5分钟周期，后复权
+                {'kline_period': '1m', 'adjust_type': '1'},  # 复权: '0'不复权  '1'后复权  '2'前复权
+                {'kline_period': '5m', 'adjust_type': '1'},  # 同上
             ]
     })
     

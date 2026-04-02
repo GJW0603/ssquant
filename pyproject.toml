@@ -4,30 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ssquant"
-version = "0.4.2"
+version = "0.4.3"
 description = "专业的期货CTP量化交易框架"
 readme = "README.md"
 requires-python = ">=3.9,<3.15"
 license = {text = "Proprietary - Non-Commercial Use Only"}
 authors = [
     {name = "SSQuant Team", email = "339093103@qq.com"}
-]
-keywords = ["futures", "trading", "quantitative", "CTP", "backtest", "algorithmic-trading"]
-classifiers = [
-    "Development Status :: 4 - Beta",
-    "Intended Audience :: Financial and Insurance Industry",
-    "Intended Audience :: Developers",
-    "Topic :: Office/Business :: Financial :: Investment",
-    "License :: Other/Proprietary License",
-    "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.9",
-    "Programming Language :: Python :: 3.10",
-    "Programming Language :: Python :: 3.11",
-    "Programming Language :: Python :: 3.12",
-    "Programming Language :: Python :: 3.13",
-    "Programming Language :: Python :: 3.14",
-    "Operating System :: Microsoft :: Windows",
-    "Operating System :: POSIX :: Linux",
 ]
 
 dependencies = [
@@ -44,18 +27,10 @@ ml = [
     "joblib>=1.0.0",
     "statsmodels>=0.12.0",
 ]
-dev = [
-    "pytest>=6.0.0",
-    "black>=21.0",
-    "flake8>=3.9.0",
-]
 
 [project.urls]
 Homepage = "https://github.com/songshuquant/ssquant"
-Documentation = "https://github.com/songshuquant/ssquant#readme"
 Repository = "https://github.com/songshuquant/ssquant"
-"Bug Tracker" = "https://github.com/songshuquant/ssquant/issues"
-PyPI = "https://pypi.org/project/ssquant/"
 
 [tool.setuptools.packages.find]
 where = ["."]

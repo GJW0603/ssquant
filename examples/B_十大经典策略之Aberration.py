@@ -13,6 +13,19 @@
 3. 当价格突破N日最高价+K倍ATR时买入
 4. 当价格跌破N日最低价-K倍ATR时卖出
 5. 采用移动止损保护利润
+
+合约代码 symbol 怎么填：
+  回测：品种+888 = 主力连续合约，用于拉取连续K线（如 au888、rb888）
+  SIMNOW / 实盘（自动主力映射）：
+    au888  → 自动映射为当前主力月份（如 au888→au2508），用于CTP订阅和下单
+    au777  → 自动映射为次主力月份
+    au2508 → 指定月份，直接使用，不做映射
+
+自动移仓（仅 SIMNOW/实盘）：持仓过主力换月时，开启 auto_roll_enabled=True 即可自动平旧开新
+合约参数（乘数、最小变动价、手续费等）自动获取，无需手动填写
+复权 adjust_type：'0'=不复权  '1'=后复权  '2'=前复权
+K线来源 kline_source（仅 SIMNOW/实盘）：'local'=本地CTP Tick合成（默认）  'data_server'=远程推送
+账户配置：在 trading_config.py 的 ACCOUNTS 中填写CTP账号信息
 """
 from ssquant.api.strategy_api import StrategyAPI
 from ssquant.backtest.unified_runner import UnifiedStrategyRunner, RunMode
@@ -111,11 +124,11 @@ if __name__ == "__main__":
         # ==================== 回测配置 ====================
         config = get_config(RUN_MODE,
             # -------- 基础配置 --------
-            symbol='au888',                   # 合约代码 (连续合约用888后缀)
+            symbol='au888',                   # 品种+888 = 主力连续合约（回测时用于拉取连续K线）
             start_date='2025-12-01',          # 回测开始日期
             end_date='2026-01-31',            # 回测结束日期
             kline_period='1m',                # K线周期
-            adjust_type='1',                  # 复权类型: '0'不复权, '1'后复权
+            adjust_type='1',                  # 复权: '0'不复权  '1'后复权  '2'前复权
             
             # -------- 合约参数（自动获取，无需手动填写）--------
             # price_tick=自动,                # 最小变动价位（自动从远程获取）
@@ -138,29 +151,36 @@ if __name__ == "__main__":
             account='simnow_default',         # 账户名称
             server_name='电信1',              # 服务器: '电信1','电信2','移动','TEST'(盘后测试)
             
-            # -------- K线数据源（可选）--------
-            # 默认 'local': 本地 CTP Tick 实时聚合K线
-            # 切换 'data_server': K线由 data_server WebSocket 推送（需 data_server 运行中）
-            #kline_source='data_server', #取消注释即可使用data_server推送的K线
+            # -------- K线数据来源 --------
+            # 'local' = 本地CTP Tick合成K线（默认）  'data_server' = 远程推送（需配置账号密码）
+            # kline_source='data_server',
             
-            # -------- 合约配置 --------
-            symbol='au2602',                  # 交易合约代码
+            # -------- 合约与周期 --------
+            # 合约代码写法：
+            #   au888 → 主力合约（自动映射）  au777 → 次主力  au2508 → 指定月份
+            symbol='au888',
             kline_period='1m',                # K线周期
             
-            # -------- 交易参数（price_tick 自动获取）--------
+            # -------- 下单参数 --------
             # price_tick=自动,                # 最小变动价位（自动从远程获取）
             order_offset_ticks=10,            # 委托偏移跳数
             
             # -------- 智能算法交易配置 --------
+            # 开启后，未成交的委托会自动撤单并以更优价格重新挂单
             algo_trading=False,               # 启用算法交易
             order_timeout=10,                 # 订单超时时间(秒)
             retry_limit=3,                    # 最大重试次数
             retry_offset_ticks=5,             # 重试时的超价跳数
             
+            # -------- 自动移仓（主力合约换月）--------
+            # 开启后，主力切换时自动平旧→开新，适合中长线策略
+            auto_roll_enabled=False,           # 是否启用自动移仓
+            auto_roll_reopen=True,             # 平旧仓后是否自动在新主力上补开仓位
+            
             # -------- 历史数据配置 --------
             preload_history=True,             # 预加载历史K线 (ATR+布林带需要100根)
             history_lookback_bars=100,        # 预加载数量
-            adjust_type='1',                  # 复权类型
+            adjust_type='1',                  # 复权: '0'不复权  '1'后复权  '2'前复权
             
             # -------- 数据窗口配置 --------
             lookback_bars=500,                # K线/TICK回溯窗口 (0=不限制，策略get_klines返回的最大条数)
@@ -181,29 +201,34 @@ if __name__ == "__main__":
             # -------- 账户配置 --------
             account='real_default',           # 账户名称
             
-            # -------- K线数据源（可选）--------
-            # 默认 'local': 本地 CTP Tick 实时聚合K线
-            # 切换 'data_server': K线由 data_server WebSocket 推送（需 data_server 运行中）
-            #kline_source='data_server', #取消注释即可使用data_server推送的K线
+            # -------- K线数据来源 --------
+            # 'local' = 本地CTP Tick合成K线（默认）  'data_server' = 远程推送（需配置账号密码）
+            # kline_source='data_server',
             
-            # -------- 合约配置 --------
-            symbol='au2602',                  # 交易合约代码
+            # -------- 合约与周期 --------
+            symbol='au888',
             kline_period='1m',                # K线周期
             
-            # -------- 交易参数（price_tick 自动获取）--------
+            # -------- 下单参数 --------
             # price_tick=自动,                # 最小变动价位（自动从远程获取）
             order_offset_ticks=10,            # 委托偏移跳数
             
             # -------- 智能算法交易配置 --------
+            # 开启后，未成交的委托会自动撤单并以更优价格重新挂单
             algo_trading=False,               # 启用算法交易
             order_timeout=10,                 # 订单超时时间(秒)
             retry_limit=3,                    # 最大重试次数
             retry_offset_ticks=5,             # 重试时的超价跳数
             
+            # -------- 自动移仓（主力合约换月）--------
+            # 开启后，主力切换时自动平旧→开新，适合中长线策略
+            auto_roll_enabled=False,           # 是否启用自动移仓
+            auto_roll_reopen=True,             # 平旧仓后是否自动在新主力上补开仓位
+            
             # -------- 历史数据配置 --------
             preload_history=True,             # 预加载历史K线
             history_lookback_bars=100,        # 预加载数量
-            adjust_type='1',                  # 复权类型
+            adjust_type='1',                  # 复权: '0'不复权  '1'后复权  '2'前复权
             
             # -------- 数据窗口配置 --------
             lookback_bars=500,                # K线/TICK回溯窗口 (0=不限制，策略get_klines返回的最大条数)

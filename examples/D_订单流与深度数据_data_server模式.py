@@ -49,7 +49,7 @@ data_server K线包含的完整字段:
    - 买一抬升 + 卖一不动 → 买压增强
    - 卖一下移 + 买一不动 → 卖压增强
 
-5. 各因子加权评分，超过阈值时交易
+5. 各因子净差比×125放大评分，超过阈值时开仓，反向超过缓冲线时平仓
 
 使用前提:
 =================================
@@ -93,13 +93,15 @@ def order_flow_strategy(api: StrategyAPI):
         lookback: 订单流统计回看窗口（K线根数）
         score_threshold: 开仓评分阈值（满分100）
         ma_period: 趋势过滤均线周期
-        volume_filter: 成交量过滤（低于N根均值的倍数时不交易）
+        exit_ratio: 平仓反向阈值比例（评分反向达到 score_threshold * exit_ratio 时平仓）
+        min_hold: 最小持仓周期（开仓后至少持有N根K线才允许平仓/反手）
     """
     # 获取参数
-    lookback = api.get_param('lookback', 5)           # 回看5根K线的订单流
-    score_threshold = api.get_param('score_threshold', 25)  # 25分以上才开仓（4因子各25分，满分100）
-    ma_period = api.get_param('ma_period', 20)        # 20周期均线做趋势过滤
-    volume_filter = api.get_param('volume_filter', 0.3)  # 成交量低于均值30%不交易
+    lookback = api.get_param('lookback', 15)          # 回看15根K线的订单流（平滑噪声）
+    score_threshold = api.get_param('score_threshold', 40)  # 40分以上才开仓（需多因子共振）
+    ma_period = api.get_param('ma_period', 60)        # 60周期均线做趋势过滤（3m×60=3小时趋势）
+    exit_ratio = api.get_param('exit_ratio', 0.6)     # 平仓缓冲：评分反向达阈值60%才平仓
+    min_hold = api.get_param('min_hold', 20)          # 开仓后至少持有20根K线（3m×20=1小时）
     
     # 确保有数据源
     if not api.require_data_sources(1):
@@ -113,9 +115,15 @@ def order_flow_strategy(api: StrategyAPI):
     bar_datetime = api.get_datetime(0)
     bar_idx = api.get_idx(0)
     close = klines['close']
-    volume = klines['volume']
     current_pos = api.get_pos(0)
     current_price = close.iloc[-1]
+    # 打印当前处理的数据
+    if bar_idx % 1 == 0:
+        api.log(f"当前Bar索引: {bar_idx}, 日期时间: {bar_datetime},K线:{klines}")
+
+    if not hasattr(order_flow_strategy, '_entry_bar'):
+        order_flow_strategy._entry_bar = 0
+    bars_since_entry = bar_idx - order_flow_strategy._entry_bar
     
     # ========== 首次触发：打印字段信息 ==========
     if bar_idx <= 1:
@@ -153,14 +161,12 @@ def order_flow_strategy(api: StrategyAPI):
         
         total_open = recent_duo_kai + recent_kong_kai
         if total_open > 0:
-            # 多开占比：0.5为中性，>0.5看多，<0.5看空
-            duo_kai_ratio = recent_duo_kai / total_open
-            factor1_score = (duo_kai_ratio - 0.5) * 2 * 25  # 映射到 [-25, +25]
-            factor1_score = max(-25, min(25, factor1_score))
+            net_ratio = (recent_duo_kai - recent_kong_kai) / total_open
+            factor1_score = max(-25, min(25, net_ratio * 125))
         
         factor_details['订单流动量'] = (
             f"多开:{recent_duo_kai:.0f} 空开:{recent_kong_kai:.0f} "
-            f"多开占比:{recent_duo_kai/max(total_open,1)*100:.1f}% "
+            f"净比:{(recent_duo_kai-recent_kong_kai)/max(total_open,1)*100:+.1f}% "
             f"得分:{factor1_score:+.1f}"
         )
     
@@ -178,13 +184,12 @@ def order_flow_strategy(api: StrategyAPI):
         
         total_bs = recent_buy + recent_sell
         if total_bs > 0:
-            buy_ratio = recent_buy / total_bs
-            factor2_score = (buy_ratio - 0.5) * 2 * 25
-            factor2_score = max(-25, min(25, factor2_score))
+            net_ratio = (recent_buy - recent_sell) / total_bs
+            factor2_score = max(-25, min(25, net_ratio * 125))
         
         factor_details['主动买卖'] = (
             f"B:{recent_buy:.0f} S:{recent_sell:.0f} "
-            f"买占比:{recent_buy/max(total_bs,1)*100:.1f}% "
+            f"净比:{(recent_buy-recent_sell)/max(total_bs,1)*100:+.1f}% "
             f"得分:{factor2_score:+.1f}"
         )
     
@@ -202,17 +207,13 @@ def order_flow_strategy(api: StrategyAPI):
         
         total_kp = recent_kai + recent_ping
         if total_kp > 0:
-            kai_ratio = recent_kai / total_kp
-            # 资金流向需要结合价格方向
-            # 开仓多 + 价格涨 → 多头资金入场（加分）
-            # 开仓多 + 价格跌 → 空头资金入场（减分）
+            net_ratio = (recent_kai - recent_ping) / total_kp
             price_direction = 1 if close.iloc[-1] > close.iloc[-lookback] else -1
-            factor3_score = (kai_ratio - 0.5) * 2 * 25 * price_direction
-            factor3_score = max(-25, min(25, factor3_score))
+            factor3_score = max(-25, min(25, net_ratio * 125 * price_direction))
         
         factor_details['资金流向'] = (
             f"开仓:{recent_kai:.0f} 平仓:{recent_ping:.0f} "
-            f"开仓占比:{recent_kai/max(total_kp,1)*100:.1f}% "
+            f"净比:{(recent_kai-recent_ping)/max(total_kp,1)*100:+.1f}% "
             f"得分:{factor3_score:+.1f}"
         )
     
@@ -255,7 +256,9 @@ def order_flow_strategy(api: StrategyAPI):
         )
     
     total_score += factor4_score
-    
+    # ========== 输出分析信息 ==========
+
+
     # ========== 趋势过滤 ==========
     ma = close.rolling(ma_period).mean()
     if pd.isna(ma.iloc[-1]):
@@ -264,18 +267,7 @@ def order_flow_strategy(api: StrategyAPI):
     trend_up = current_price > ma.iloc[-1]
     trend_down = current_price < ma.iloc[-1]
     
-    # ========== 成交量过滤 ==========
-    avg_volume = volume.rolling(ma_period).mean().iloc[-1]
-    current_volume = volume.iloc[-1]
-    volume_ok = current_volume >= avg_volume * volume_filter if avg_volume > 0 else True
-    
-    # ========== 输出分析信息 ==========
-    print(f"\n[{bar_datetime}] 价格:{current_price:.2f} | "
-          f"MA{ma_period}:{ma.iloc[-1]:.2f} | "
-          f"趋势:{'↑多' if trend_up else '↓空'} | "
-          f"量:{current_volume:.0f}/{avg_volume:.0f} | "
-          f"持仓:{current_pos} | "
-          f"总评分:{total_score:+.1f}")
+
     
     for name, detail in factor_details.items():
         print(f"  [{name}] {detail}")
@@ -288,73 +280,75 @@ def order_flow_strategy(api: StrategyAPI):
     
     # ========== 交易决策 ==========
     unit = 1
-    
-    if not volume_ok:
-        # 成交量不足，不交易
-        return
+    exit_line = score_threshold * exit_ratio
+    can_exit = (current_pos == 0) or (bars_since_entry >= min_hold)
     
     # 开多条件: 评分超过阈值 + 趋势向上
     if total_score >= score_threshold and trend_up:
-        if current_pos < 0:
+        if current_pos < 0 and can_exit:
             api.log(f"⚡ 评分{total_score:+.1f}≥{score_threshold}，趋势↑，平空反多 "
                     f"价格:{current_price:.2f}")
             api.buycover(volume=unit, order_type='next_bar_open', index=0)
             api.buy(volume=unit, order_type='next_bar_open', index=0)
+            order_flow_strategy._entry_bar = bar_idx
         elif current_pos == 0:
             api.log(f"⚡ 评分{total_score:+.1f}≥{score_threshold}，趋势↑，开多 "
                     f"价格:{current_price:.2f}")
             api.buy(volume=unit, order_type='next_bar_open', index=0)
+            order_flow_strategy._entry_bar = bar_idx
     
     # 开空条件: 评分低于负阈值 + 趋势向下
     elif total_score <= -score_threshold and trend_down:
-        if current_pos > 0:
+        if current_pos > 0 and can_exit:
             api.log(f"⚡ 评分{total_score:+.1f}≤{-score_threshold}，趋势↓，平多反空 "
                     f"价格:{current_price:.2f}")
             api.sell(volume=unit, order_type='next_bar_open', index=0)
             api.sellshort(volume=unit, order_type='next_bar_open', index=0)
+            order_flow_strategy._entry_bar = bar_idx
         elif current_pos == 0:
             api.log(f"⚡ 评分{total_score:+.1f}≤{-score_threshold}，趋势↓，开空 "
                     f"价格:{current_price:.2f}")
             api.sellshort(volume=unit, order_type='next_bar_open', index=0)
+            order_flow_strategy._entry_bar = bar_idx
     
-    # 平仓条件: 持仓方向与评分方向相反
-    elif current_pos > 0 and total_score < 0:
-        api.log(f"📤 多头评分转负({total_score:+.1f})，平多 价格:{current_price:.2f}")
+    # 平仓条件: 评分明显反向 + 已过最小持仓周期
+    elif current_pos > 0 and total_score < -exit_line and can_exit:
+        api.log(f"📤 多头评分反转({total_score:+.1f}<{-exit_line:.0f})，持仓{bars_since_entry}根，平多 价格:{current_price:.2f}")
         api.sell(volume=unit, order_type='next_bar_open', index=0)
     
-    elif current_pos < 0 and total_score > 0:
-        api.log(f"📤 空头评分转正({total_score:+.1f})，平空 价格:{current_price:.2f}")
+    elif current_pos < 0 and total_score > exit_line and can_exit:
+        api.log(f"📤 空头评分反转({total_score:+.1f}>{exit_line:.0f})，持仓{bars_since_entry}根，平空 价格:{current_price:.2f}")
         api.buycover(volume=unit, order_type='next_bar_open', index=0)
 
 
 if __name__ == "__main__":
     
     # ========== 选择运行模式 ==========
-    RUN_MODE = RunMode.BACKTEST
+    RUN_MODE = RunMode.SIMNOW
     
     # ========== 策略参数 ==========
     strategy_params = {
         'lookback': 5,              # 订单流回看窗口（根数）
         'score_threshold': 25,      # 开仓评分阈值（4因子各25分，满分±100）
         'ma_period': 20,            # 趋势过滤均线
-        'volume_filter': 0.3,       # 成交量过滤倍数
+        'exit_ratio': 0.4,          # 平仓缓冲：评分反向达阈值40%才平仓
     }
     
     # ========== 选择交易品种 ==========
     # 建议选择活跃品种（成交量大、订单流数据丰富）
-    SYMBOL = 'au2604'       # 螺纹钢（活跃品种，订单流数据质量好）
-    PERIOD = '1m'           # 1分钟K线（订单流在短周期更有意义）
+    SYMBOL = 'sc2605'       # 螺纹钢（活跃品种，订单流数据质量好）
+    PERIOD = '1m'           # 3分钟K线（订单流在短周期更有意义）
     
     # ========== 获取配置 ==========
     if RUN_MODE == RunMode.BACKTEST:
         # ==================== 回测模式（data_server 有订单流数据时同样可用） ====================
         config = get_config(RUN_MODE,
-            start_date='2025-12-01',
-            end_date='2026-01-31',
+            start_date='2026-3-04',
+            end_date='2026-03-31',
             initial_capital=100000,
             lookback_bars=500,
             data_sources=[{
-                'symbol': SYMBOL.replace(SYMBOL[-4:], '888'),  # 回测用888
+                'symbol': 'SH888',  # 回测用888
                 'kline_period': PERIOD,
                 'adjust_type': '1',
                 'slippage_ticks': 1,
@@ -365,7 +359,7 @@ if __name__ == "__main__":
         # ==================== SIMNOW + data_server（完整订单流+深度数据） ====================
         config = get_config(RUN_MODE,
             account='simnow_default',
-            server_name='TEST',
+            server_name='电信1',
             
             # 【核心】data_server K线模式
             kline_source='data_server',
@@ -444,9 +438,9 @@ if __name__ == "__main__":
     print("  持仓:   openint(变化量)/cumulative_openint(绝对值)")
     print()
     print("多因子评分体系 (满分±100):")
-    print("  [25分] 订单流动量 = 多开占比偏离50%")
-    print("  [25分] 主动买卖   = B占比偏离50%")
-    print("  [25分] 资金流向   = 开仓占比×价格方向")
+    print("  [25分] 订单流动量 = (多开-空开)/(多开+空开) × 125")
+    print("  [25分] 主动买卖   = (B-S)/(B+S) × 125")
+    print("  [25分] 资金流向   = (开仓-平仓)/(开仓+平仓) × 125 × 价格方向")
     print("  [25分] 盘口压力   = 买一抬升 vs 卖一抬升")
     print("=" * 80 + "\n")
     

@@ -240,7 +240,8 @@ class UnifiedStrategyRunner:
     def _run_backtest(self) -> Dict[str, Any]:
         """运行历史回测"""
         # 鉴权检查
-        from ..data.auth_manager import verify_auth, get_auth_message
+        from ..data.auth_manager import verify_auth, get_auth_message, set_effective_data_server
+        set_effective_data_server(self.config.get('data_server'))
         if not verify_auth():
             raise RuntimeError(f"鉴权失败: {get_auth_message()}")
         
@@ -249,6 +250,22 @@ class UnifiedStrategyRunner:
         
         # 创建回测器
         self.backtester = MultiSourceBacktester()
+
+        # 回测账户初始资金：
+        # - 单数据源：使用顶层 initial_capital
+        # - 多数据源：汇总每个品种实际生效的 initial_capital，作为组合账户总初始资金
+        total_initial_capital = 0
+        if 'data_sources' in self.config:
+            symbol_initial_capitals = {}
+            for ds_config in self.config['data_sources']:
+                symbol = ds_config['symbol']
+                symbol_initial_capitals[symbol] = ds_config.get(
+                    'initial_capital',
+                    self.config.get('initial_capital', 100000)
+                )
+            total_initial_capital = sum(symbol_initial_capitals.values()) or self.config.get('initial_capital', 100000)
+        else:
+            total_initial_capital = self.config.get('initial_capital', 100000)
         
         # 设置基础配置
         lookback_bars = self.config.get('lookback_bars', 500)
@@ -260,7 +277,8 @@ class UnifiedStrategyRunner:
             'align_data': self.config.get('align_data', False),
             'fill_method': self.config.get('fill_method', 'ffill'),
             'lookback_bars': lookback_bars,  # K线回溯窗口大小
-            'debug': self.config.get('debug', False)
+            'debug': self.config.get('debug', False),
+            'initial_capital': total_initial_capital,
         })
         
         # 添加数据源配置（支持单数据源和多数据源）
@@ -333,7 +351,7 @@ class UnifiedStrategyRunner:
                         'start_time': self.config.get('start_time'),
                         'end_time': self.config.get('end_time'),
                         'limit': self.config.get('limit'),
-                        'initial_capital': self.config.get('initial_capital', 100000),
+                        'initial_capital': ds_config.get('initial_capital', self.config.get('initial_capital', 100000)),
                         'commission': ds_config.get('commission',
                                                     auto_params.get('commission',
                                                     self.config.get('commission', 0.0001))),
@@ -402,11 +420,17 @@ class UnifiedStrategyRunner:
                 }
             )
         
+        # 将回测期实际生效的品种配置注入策略参数，便于策略按真实初始资金/乘数/保证金率计算仓位。
+        effective_strategy_params = dict(self.strategy_params or {})
+        effective_strategy_params['symbol_configs'] = {
+            symbol: config.copy() for symbol, config in self.backtester.symbol_configs.items()
+        }
+
         # 运行回测
         results = self.backtester.run(
             strategy=self.strategy_func,
             initialize=self.initialize_func,
-            strategy_params=self.strategy_params
+            strategy_params=effective_strategy_params
         )
         
         return results

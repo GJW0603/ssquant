@@ -65,6 +65,187 @@ class DataSource:
         self.pending_orders = []  # 存储待执行的订单
         self.original_data = None
         self._is_higher_tf = False
+        self.symbol_config = {}
+        self.account_info = None
+        self.account_sync_callback = None
+
+    def configure_backtest_context(self, symbol_config: Optional[Dict[str, Any]] = None,
+                                   account_info: Optional[Dict[str, Any]] = None,
+                                   account_sync_callback=None):
+        """绑定回测账户上下文，用于资金校验与实时账户同步。"""
+        self.symbol_config = (symbol_config or {}).copy()
+        self.account_info = account_info
+        self.account_sync_callback = account_sync_callback
+
+    def _sync_backtest_account(self):
+        """同步回测账户快照，保证同一根K线内的后续下单也能看到最新资金。"""
+        if callable(self.account_sync_callback):
+            self.account_sync_callback()
+
+    def _get_open_cost_per_lot(self, price: Optional[float]) -> float:
+        """估算开仓每手占用资金（保证金+开仓手续费）。"""
+        if price is None or price <= 0:
+            return 0.0
+
+        margin_required = self._get_margin_required(price, 1)
+        open_commission = self._get_trade_commission("开多", price, 1)
+        return margin_required + open_commission
+
+    def _use_fixed_commission(self) -> bool:
+        commission_rate = float(self.symbol_config.get('commission', 0.0003) or 0.0)
+        commission_per_lot = float(self.symbol_config.get('commission_per_lot', 0) or 0.0)
+        return commission_rate < 1e-05 and commission_per_lot > 0.1
+
+    def _get_margin_required(self, price: Optional[float], volume: int) -> float:
+        if price is None or price <= 0 or volume <= 0:
+            return 0.0
+        contract_multiplier = float(self.symbol_config.get('contract_multiplier', 10) or 10)
+        margin_rate = float(self.symbol_config.get('margin_rate', 0.1) or 0.1)
+        return float(price) * int(volume) * contract_multiplier * margin_rate
+
+    def _get_trade_commission(self, action: str, price: Optional[float], volume: int) -> float:
+        if price is None or price <= 0 or volume <= 0:
+            return 0.0
+
+        volume = int(volume)
+        contract_multiplier = float(self.symbol_config.get('contract_multiplier', 10) or 10)
+        commission_rate = float(self.symbol_config.get('commission', 0.0003) or 0.0)
+        commission_per_lot = float(self.symbol_config.get('commission_per_lot', 0) or 0.0)
+        commission_close_per_lot = float(self.symbol_config.get('commission_close_per_lot', 0) or 0.0)
+
+        if self._use_fixed_commission():
+            if action in ("平多", "平空"):
+                fixed_per_lot = commission_close_per_lot if commission_close_per_lot > 0 else commission_per_lot
+            else:
+                fixed_per_lot = commission_per_lot
+            return fixed_per_lot * volume
+
+        return float(price) * volume * contract_multiplier * commission_rate
+
+    def get_runtime_account_snapshot(self, current_price: Optional[float] = None) -> Dict[str, float]:
+        """根据运行中的成交记录重建该数据源的账户快照。"""
+        contract_multiplier = float(self.symbol_config.get('contract_multiplier', 10) or 10)
+        margin_rate = float(self.symbol_config.get('margin_rate', 0.1) or 0.1)
+        current_price = float(current_price or self.current_price or 0.0)
+
+        long_pos = 0
+        long_avg_price = 0.0
+        short_pos = 0
+        short_avg_price = 0.0
+        close_profit = 0.0
+        total_commission = 0.0
+
+        def open_long(price: float, volume: int):
+            nonlocal long_pos, long_avg_price, total_commission
+            total_commission += self._get_trade_commission("开多", price, volume)
+            if long_pos > 0:
+                long_avg_price = (long_pos * long_avg_price + volume * price) / (long_pos + volume)
+            else:
+                long_avg_price = price
+            long_pos += volume
+
+        def close_long(price: float, volume: int) -> int:
+            nonlocal long_pos, long_avg_price, close_profit, total_commission
+            actual_volume = min(volume, long_pos)
+            if actual_volume <= 0:
+                return 0
+            total_commission += self._get_trade_commission("平多", price, actual_volume)
+            close_profit += (price - long_avg_price) * actual_volume * contract_multiplier
+            long_pos -= actual_volume
+            if long_pos <= 0:
+                long_pos = 0
+                long_avg_price = 0.0
+            return actual_volume
+
+        def open_short(price: float, volume: int):
+            nonlocal short_pos, short_avg_price, total_commission
+            total_commission += self._get_trade_commission("开空", price, volume)
+            if short_pos > 0:
+                short_avg_price = (short_pos * short_avg_price + volume * price) / (short_pos + volume)
+            else:
+                short_avg_price = price
+            short_pos += volume
+
+        def close_short(price: float, volume: int) -> int:
+            nonlocal short_pos, short_avg_price, close_profit, total_commission
+            actual_volume = min(volume, short_pos)
+            if actual_volume <= 0:
+                return 0
+            total_commission += self._get_trade_commission("平空", price, actual_volume)
+            close_profit += (short_avg_price - price) * actual_volume * contract_multiplier
+            short_pos -= actual_volume
+            if short_pos <= 0:
+                short_pos = 0
+                short_avg_price = 0.0
+            return actual_volume
+
+        for trade in self.trades:
+            action = trade.get('action')
+            price = float(trade.get('price', 0) or 0.0)
+            volume = int(trade.get('volume', 0) or 0)
+            if price <= 0 or volume <= 0:
+                continue
+
+            if action == "开多":
+                open_long(price, volume)
+            elif action == "平多":
+                close_long(price, volume)
+            elif action == "开空":
+                open_short(price, volume)
+            elif action == "平空":
+                close_short(price, volume)
+            elif action == "平多开空":
+                reversed_volume = close_long(price, volume)
+                if reversed_volume > 0:
+                    open_short(price, reversed_volume)
+            elif action == "平空开多":
+                reversed_volume = close_short(price, volume)
+                if reversed_volume > 0:
+                    open_long(price, reversed_volume)
+
+        long_position_profit = (current_price - long_avg_price) * long_pos * contract_multiplier if long_pos > 0 else 0.0
+        short_position_profit = (short_avg_price - current_price) * short_pos * contract_multiplier if short_pos > 0 else 0.0
+        position_profit = long_position_profit + short_position_profit
+        curr_margin = (long_pos + short_pos) * current_price * contract_multiplier * margin_rate
+
+        return {
+            'close_profit': close_profit,
+            'commission': total_commission,
+            'position_profit': position_profit,
+            'curr_margin': curr_margin,
+        }
+
+    def _fit_open_volume_to_funds(self, requested_volume: int, price: Optional[float],
+                                  extra_reserved_funds: float = 0.0):
+        """
+        根据当前可用资金裁剪开仓手数。
+
+        返回:
+            (actual_volume, reserved_funds)
+        """
+        requested_volume = int(requested_volume or 0)
+        if requested_volume <= 0:
+            return 0, 0.0
+
+        cost_per_lot = self._get_open_cost_per_lot(price)
+        if cost_per_lot <= 0:
+            return requested_volume, 0.0
+
+        if self.account_info is None:
+            return requested_volume, cost_per_lot * requested_volume
+
+        available = float(self.account_info.get('available', 0) or 0.0) + max(0.0, float(extra_reserved_funds or 0.0))
+        max_volume = int(np.floor(available / cost_per_lot)) if cost_per_lot > 0 else requested_volume
+        actual_volume = max(0, min(requested_volume, max_volume))
+        reserved_funds = cost_per_lot * actual_volume
+        return actual_volume, reserved_funds
+
+    def _mark_insufficient_funds(self, message: str = ""):
+        if self.account_info is not None:
+            self.account_info['_last_order_rejected_for_funds'] = True
+            self.account_info['_fund_reject_count'] = int(self.account_info.get('_fund_reject_count', 0) or 0) + 1
+            if message:
+                self.account_info['_last_fund_reject_reason'] = message
         
     def set_data(self, data: pd.DataFrame):
         """设置数据"""
@@ -225,6 +406,31 @@ class DataSource:
                 elif action in ["开空", "平多", "平多开空"]:
                     # 卖出方向：价格下滑
                     price = price - slippage_per_unit
+
+                if action in ["开多", "开空"]:
+                    reserved_funds = float(order.get('reserved_funds', 0.0) or 0.0)
+                    actual_volume, actual_reserved = self._fit_open_volume_to_funds(
+                        volume, price, extra_reserved_funds=reserved_funds
+                    )
+                    if actual_volume <= 0:
+                        if log_callback:
+                            log_callback(
+                                f"{self.symbol} {self.kline_period} 取消待执行开仓订单: "
+                                f"资金不足，请求{volume}手，执行价{price:.2f}"
+                            )
+                        self._mark_insufficient_funds(
+                            f"{self.symbol} {self.kline_period} 待执行开仓被取消：资金不足，请求{volume}手，执行价{price:.2f}"
+                        )
+                        order['reserved_funds'] = 0.0
+                        orders_to_remove.append(i)
+                        self._sync_backtest_account()
+                        continue
+                    if actual_volume < volume and log_callback:
+                        log_callback(
+                            f"{self.symbol} {self.kline_period} 待执行开仓资金不足: "
+                            f"{volume}手自动调整为{actual_volume}手"
+                        )
+                    volume = actual_volume
                 
                 # 更新持仓
                 if action == "开多":
@@ -237,6 +443,7 @@ class DataSource:
                     if actual_volume <= 0:
                         # 没有多头持仓可平，跳过此订单
                         orders_to_remove.append(i)
+                        self._sync_backtest_account()
                         continue
                     self.target_pos = self.current_pos - actual_volume
                     volume = actual_volume  # 更新volume为实际交易量
@@ -250,6 +457,7 @@ class DataSource:
                     if actual_volume <= 0:
                         # 没有空头持仓可平，跳过此订单
                         orders_to_remove.append(i)
+                        self._sync_backtest_account()
                         continue
                     self.target_pos = self.current_pos + actual_volume
                     volume = actual_volume  # 更新volume为实际交易量
@@ -268,11 +476,16 @@ class DataSource:
                     log_callback(f"{self.symbol} {self.kline_period} 执行订单: {action} {volume}手 成交价:{price:.2f} 类型:{order_type} 原因:{reason}")
                 
                 # 标记为待移除
+                order['reserved_funds'] = 0.0
                 orders_to_remove.append(i)
+                self._sync_backtest_account()
         
         # 移除已执行的订单（从后往前移除，避免索引问题）
         for i in sorted(orders_to_remove, reverse=True):
             self.pending_orders.pop(i)
+
+        if orders_to_remove:
+            self._sync_backtest_account()
         
     def buy(self, volume: int = 1, reason: str = "", log_callback=None, order_type='bar_close', offset_ticks: Optional[int] = None, price: Optional[float] = None):
         """
@@ -304,6 +517,18 @@ class DataSource:
             price = self.get_current_price()
             if price is None:
                 return False
+
+            actual_volume, _ = self._fit_open_volume_to_funds(volume, price)
+            if actual_volume <= 0:
+                if log_callback and debug_mode:
+                    log_callback(f"{self.symbol} {self.kline_period} 开多失败: 资金不足，请求{volume}手 成交价:{price:.2f}")
+                self._mark_insufficient_funds(
+                    f"{self.symbol} {self.kline_period} 开多失败：资金不足，请求{volume}手，参考价{price:.2f}"
+                )
+                return False
+            if actual_volume < volume and log_callback and debug_mode:
+                log_callback(f"{self.symbol} {self.kline_period} 开多资金不足: {volume}手自动调整为{actual_volume}手")
+            volume = actual_volume
                 
             self.target_pos = self.current_pos + volume
             if reason:
@@ -312,6 +537,7 @@ class DataSource:
             
             # 记录交易
             self.add_trade("开多", price, volume, reason)
+            self._sync_backtest_account()
             return True
         elif order_type == 'market':
             # 市价单，TICK数据买入使用卖一价格(AskPrice1)
@@ -323,6 +549,18 @@ class DataSource:
             
             if price is None:
                 return False
+
+            actual_volume, _ = self._fit_open_volume_to_funds(volume, price)
+            if actual_volume <= 0:
+                if log_callback and debug_mode:
+                    log_callback(f"{self.symbol} {self.kline_period} 市价买入失败: 资金不足，请求{volume}手 成交价:{price:.2f}")
+                self._mark_insufficient_funds(
+                    f"{self.symbol} {self.kline_period} 市价买入失败：资金不足，请求{volume}手，参考价{price:.2f}"
+                )
+                return False
+            if actual_volume < volume and log_callback and debug_mode:
+                log_callback(f"{self.symbol} {self.kline_period} 市价买入资金不足: {volume}手自动调整为{actual_volume}手")
+            volume = actual_volume
                 
             self.target_pos = self.current_pos + volume
             if reason:
@@ -335,11 +573,25 @@ class DataSource:
             if log_callback and debug_mode:
                 log_callback(f"{self.symbol} {self.kline_period} 市价买入: {volume}手 成交价:{price:.2f} 原因:{reason}")
             
+            self._sync_backtest_account()
             return True
         else:
             # 下一K线价格下单，添加到待执行队列
             if price is None:
                 price = self.get_price_by_type(order_type)
+            estimate_price = price if price is not None else self.get_current_price()
+            actual_volume, reserved_funds = self._fit_open_volume_to_funds(volume, estimate_price)
+            price_str = f"{estimate_price:.2f}" if estimate_price is not None else "未知"
+            if actual_volume <= 0:
+                if log_callback and debug_mode:
+                    log_callback(f"{self.symbol} {self.kline_period} 开多订单失败: 资金不足，请求{volume}手 参考价:{price_str}")
+                self._mark_insufficient_funds(
+                    f"{self.symbol} {self.kline_period} 开多订单失败：资金不足，请求{volume}手，参考价{price_str}"
+                )
+                return False
+            if actual_volume < volume and log_callback and debug_mode:
+                log_callback(f"{self.symbol} {self.kline_period} 开多订单资金不足: {volume}手自动调整为{actual_volume}手")
+            volume = actual_volume
             
             # 注意：如果是next_bar_open/high/low/close，价格可能为None，因为下一K线的数据尚未加载
             # 但我们仍然可以添加到待执行队列，等待下一K线时执行，再根据order_type获取正确的价格
@@ -351,13 +603,15 @@ class DataSource:
                 'price': price,  # 可能为None，将在执行时重新获取
                 'reason': reason,
                 'order_type': order_type,  # 保存订单类型
-                'execution_time': self.current_idx + 1  # 在下一K线执行
+                'execution_time': self.current_idx + 1,  # 在下一K线执行
+                'reserved_funds': reserved_funds,
             })
             
             if log_callback and debug_mode:
                 price_str = f"{price:.2f}" if price is not None else "待确定"
                 log_callback(f"{self.symbol} {self.kline_period} 添加待执行订单: 开多 {volume}手 订单类型:{order_type} 预计价格:{price_str} 原因:{reason}")
             
+            self._sync_backtest_account()
             return True
         
     def sell(self, volume: Optional[int] = None, reason: str = "", log_callback=None, order_type='bar_close', offset_ticks: Optional[int] = None, price: Optional[float] = None):
@@ -402,6 +656,7 @@ class DataSource:
             
             # 记录交易
             self.add_trade("平多", price, actual_volume, reason)
+            self._sync_backtest_account()
             return True
         elif order_type == 'market':
             # 市价单，TICK数据卖出使用买一价格(BidPrice1)
@@ -436,6 +691,7 @@ class DataSource:
             if log_callback and debug_mode:
                 log_callback(f"{self.symbol} {self.kline_period} 市价卖出: {actual_volume}手 成交价:{price:.2f} 原因:{reason}")
             
+            self._sync_backtest_account()
             return True
         else:
             # 下一K线价格下单，添加到待执行队列
@@ -493,6 +749,18 @@ class DataSource:
             price = self.get_current_price()
             if price is None:
                 return False
+
+            actual_volume, _ = self._fit_open_volume_to_funds(volume, price)
+            if actual_volume <= 0:
+                if log_callback and debug_mode:
+                    log_callback(f"{self.symbol} {self.kline_period} 开空失败: 资金不足，请求{volume}手 成交价:{price:.2f}")
+                self._mark_insufficient_funds(
+                    f"{self.symbol} {self.kline_period} 开空失败：资金不足，请求{volume}手，参考价{price:.2f}"
+                )
+                return False
+            if actual_volume < volume and log_callback and debug_mode:
+                log_callback(f"{self.symbol} {self.kline_period} 开空资金不足: {volume}手自动调整为{actual_volume}手")
+            volume = actual_volume
                 
             self.target_pos = self.current_pos - volume
             if reason:
@@ -501,6 +769,7 @@ class DataSource:
             
             # 记录交易
             self.add_trade("开空", price, volume, reason)
+            self._sync_backtest_account()
             return True
         elif order_type == 'market':
             # 市价单，TICK数据卖出使用买一价格(BidPrice1)
@@ -512,6 +781,18 @@ class DataSource:
             
             if price is None:
                 return False
+
+            actual_volume, _ = self._fit_open_volume_to_funds(volume, price)
+            if actual_volume <= 0:
+                if log_callback and debug_mode:
+                    log_callback(f"{self.symbol} {self.kline_period} 市价卖空失败: 资金不足，请求{volume}手 成交价:{price:.2f}")
+                self._mark_insufficient_funds(
+                    f"{self.symbol} {self.kline_period} 市价卖空失败：资金不足，请求{volume}手，参考价{price:.2f}"
+                )
+                return False
+            if actual_volume < volume and log_callback and debug_mode:
+                log_callback(f"{self.symbol} {self.kline_period} 市价卖空资金不足: {volume}手自动调整为{actual_volume}手")
+            volume = actual_volume
                 
             self.target_pos = self.current_pos - volume
             if reason:
@@ -524,11 +805,25 @@ class DataSource:
             if log_callback and debug_mode:
                 log_callback(f"{self.symbol} {self.kline_period} 市价卖空: {volume}手 成交价:{price:.2f} 原因:{reason}")
             
+            self._sync_backtest_account()
             return True
         else:
             # 下一K线价格下单，添加到待执行队列
             if price is None:
                 price = self.get_price_by_type(order_type)
+            estimate_price = price if price is not None else self.get_current_price()
+            actual_volume, reserved_funds = self._fit_open_volume_to_funds(volume, estimate_price)
+            price_str = f"{estimate_price:.2f}" if estimate_price is not None else "未知"
+            if actual_volume <= 0:
+                if log_callback and debug_mode:
+                    log_callback(f"{self.symbol} {self.kline_period} 开空订单失败: 资金不足，请求{volume}手 参考价:{price_str}")
+                self._mark_insufficient_funds(
+                    f"{self.symbol} {self.kline_period} 开空订单失败：资金不足，请求{volume}手，参考价{price_str}"
+                )
+                return False
+            if actual_volume < volume and log_callback and debug_mode:
+                log_callback(f"{self.symbol} {self.kline_period} 开空订单资金不足: {volume}手自动调整为{actual_volume}手")
+            volume = actual_volume
             # 注意：如果是next_bar_open/high/low/close，价格可能为None，因为下一K线的数据尚未加载
             
             # 添加到待执行队列
@@ -538,13 +833,15 @@ class DataSource:
                 'price': price,  # 可能为None，将在执行时重新获取
                 'reason': reason,
                 'order_type': order_type,  # 保存订单类型
-                'execution_time': self.current_idx + 1  # 在下一K线执行
+                'execution_time': self.current_idx + 1,  # 在下一K线执行
+                'reserved_funds': reserved_funds,
             })
             
             if log_callback and debug_mode:
                 price_str = f"{price:.2f}" if price is not None else "待确定"
                 log_callback(f"{self.symbol} {self.kline_period} 添加待执行订单: 开空 {volume}手 订单类型:{order_type} 预计价格:{price_str} 原因:{reason}")
             
+            self._sync_backtest_account()
             return True
         
     def buycover(self, volume: Optional[int] = None, reason: str = "", log_callback=None, order_type='bar_close', offset_ticks: Optional[int] = None, price: Optional[float] = None):
@@ -589,6 +886,7 @@ class DataSource:
             
             # 记录交易
             self.add_trade("平空", price, actual_volume, reason)
+            self._sync_backtest_account()
             return True
         elif order_type == 'market':
             # 市价单，TICK数据买入使用卖一价格(AskPrice1)
@@ -623,6 +921,7 @@ class DataSource:
             if log_callback and debug_mode:
                 log_callback(f"{self.symbol} {self.kline_period} 市价买平: {actual_volume}手 成交价:{price:.2f} 原因:{reason}")
             
+            self._sync_backtest_account()
             return True
         else:
             # 下一K线价格下单，添加到待执行队列
@@ -673,91 +972,71 @@ class DataSource:
         debug_mode = getattr(log_callback, 'debug_mode', True) if log_callback else True
         
         old_pos = self.current_pos
-        
-        if order_type == 'bar_close':
-            # 当前K线收盘价下单，立即执行
-            price = self.get_current_price()
-            if price is None:
-                return False
-                
-            self.target_pos = -old_pos
-            if reason:
-                self.set_signal_reason(reason)
-            self._update_pos(log_callback)
-            
-            # 记录交易
-            if old_pos > 0:
-                self.add_trade("平多开空", price, old_pos, reason)
-            elif old_pos < 0:
-                self.add_trade("平空开多", price, -old_pos, reason)
-                
+        if old_pos == 0:
             return True
-        elif order_type == 'market':
-            # 市价单，TICK数据使用对应价格
-            price = None
-            
-            # 不同持仓方向使用不同的价格
-            if old_pos > 0:  # 平多开空，卖出用买一价格(BidPrice1)
-                if 'BidPrice1' in self.data.columns and self.current_idx < len(self.data):
-                    price = self.data.iloc[self.current_idx]['BidPrice1']
-                else:
-                    price = self.get_current_price()
-            elif old_pos < 0:  # 平空开多，买入用卖一价格(AskPrice1)
-                if 'AskPrice1' in self.data.columns and self.current_idx < len(self.data):
-                    price = self.data.iloc[self.current_idx]['AskPrice1']
-                else:
-                    price = self.get_current_price()
-            else:
-                return True  # 无持仓，无需反手
-            
-            if price is None:
-                return False
-                
-            self.target_pos = -old_pos
-            if reason:
-                self.set_signal_reason(reason)
-            self._update_pos(log_callback)
-            
-            # 记录交易
-            if old_pos > 0:
-                self.add_trade("平多开空", price, old_pos, reason)
-                if log_callback and debug_mode:
-                    log_callback(f"{self.symbol} {self.kline_period} 市价反手: 平多开空 {old_pos}手 成交价:{price:.2f} 原因:{reason}")
-            elif old_pos < 0:
-                self.add_trade("平空开多", price, -old_pos, reason)
-                if log_callback and debug_mode:
-                    log_callback(f"{self.symbol} {self.kline_period} 市价反手: 平空开多 {-old_pos}手 成交价:{price:.2f} 原因:{reason}")
-                
-            return True
-        else:
-            # 下一K线价格下单，添加到待执行队列
+
+        if old_pos > 0:
+            reverse_volume = old_pos
+            if order_type in ('bar_close', 'market'):
+                if not self.sell(volume=reverse_volume, reason=reason, log_callback=log_callback, order_type=order_type):
+                    return False
+                return self.sellshort(volume=reverse_volume, reason=reason, log_callback=log_callback, order_type=order_type)
+
             price = self.get_price_by_type(order_type)
-            # 注意：如果是next_bar_open/high/low/close，价格可能为None，将在执行时获取
-            
-            # 添加到待执行队列
-            if old_pos > 0:
-                action = "平多开空"
-                volume = old_pos
-            elif old_pos < 0:
-                action = "平空开多"
-                volume = -old_pos
-            else:
-                return True  # 无持仓，无需反手
-            
             self.pending_orders.append({
-                'action': action,
-                'volume': volume,
-                'price': price,  # 可能为None，将在执行时重新获取
+                'action': "平多",
+                'volume': reverse_volume,
+                'price': price,
                 'reason': reason,
-                'order_type': order_type,  # 保存订单类型
-                'execution_time': self.current_idx + 1  # 在下一K线执行
+                'order_type': order_type,
+                'execution_time': self.current_idx + 1
             })
-            
+            self.pending_orders.append({
+                'action': "开空",
+                'volume': reverse_volume,
+                'price': price,
+                'reason': reason,
+                'order_type': order_type,
+                'execution_time': self.current_idx + 1,
+                'reserved_funds': 0.0,
+                'defer_fund_check_until_execute': True,
+            })
             if log_callback and debug_mode:
                 price_str = f"{price:.2f}" if price is not None else "待确定"
-                log_callback(f"{self.symbol} {self.kline_period} 添加待执行订单: {action} {volume}手 订单类型:{order_type} 预计价格:{price_str} 原因:{reason}")
-            
+                log_callback(f"{self.symbol} {self.kline_period} 添加待执行反手订单: 先平多后开空 {reverse_volume}手 订单类型:{order_type} 预计价格:{price_str} 原因:{reason}")
+            self._sync_backtest_account()
             return True
+
+        reverse_volume = -old_pos
+        if order_type in ('bar_close', 'market'):
+            if not self.buycover(volume=reverse_volume, reason=reason, log_callback=log_callback, order_type=order_type):
+                return False
+            return self.buy(volume=reverse_volume, reason=reason, log_callback=log_callback, order_type=order_type)
+
+        price = self.get_price_by_type(order_type)
+        self.pending_orders.append({
+            'action': "平空",
+            'volume': reverse_volume,
+            'price': price,
+            'reason': reason,
+            'order_type': order_type,
+            'execution_time': self.current_idx + 1
+        })
+        self.pending_orders.append({
+            'action': "开多",
+            'volume': reverse_volume,
+            'price': price,
+            'reason': reason,
+            'order_type': order_type,
+            'execution_time': self.current_idx + 1,
+            'reserved_funds': 0.0,
+            'defer_fund_check_until_execute': True,
+        })
+        if log_callback and debug_mode:
+            price_str = f"{price:.2f}" if price is not None else "待确定"
+            log_callback(f"{self.symbol} {self.kline_period} 添加待执行反手订单: 先平空后开多 {reverse_volume}手 订单类型:{order_type} 预计价格:{price_str} 原因:{reason}")
+        self._sync_backtest_account()
+        return True
         
     def close_all(self, reason: str = "", log_callback=None, order_type='bar_close'):
         """
@@ -775,61 +1054,9 @@ class DataSource:
         debug_mode = getattr(log_callback, 'debug_mode', True) if log_callback else True
         
         if self.current_pos > 0:
-            # 平多仓
-            if order_type == 'market':
-                # 市价单，TICK数据卖出使用买一价格(BidPrice1)
-                price = None
-                if 'BidPrice1' in self.data.columns and self.current_idx < len(self.data):
-                    price = self.data.iloc[self.current_idx]['BidPrice1']
-                else:
-                    price = self.get_current_price()
-                
-                if price is None:
-                    return False
-                    
-                volume = self.current_pos
-                self.target_pos = 0
-                if reason:
-                    self.set_signal_reason(reason)
-                self._update_pos(log_callback)
-                
-                # 记录交易
-                self.add_trade("平多", price, volume, reason)
-                
-                if log_callback and debug_mode:
-                    log_callback(f"{self.symbol} {self.kline_period} 市价平仓: 平多 {volume}手 成交价:{price:.2f} 原因:{reason}")
-                
-                return True
-            else:
-                return self.sell(volume=None, reason=reason, log_callback=log_callback, order_type=order_type)
+            return self.sell(volume=None, reason=reason, log_callback=log_callback, order_type=order_type)
         elif self.current_pos < 0:
-            # 平空仓
-            if order_type == 'market':
-                # 市价单，TICK数据买入使用卖一价格(AskPrice1)
-                price = None
-                if 'AskPrice1' in self.data.columns and self.current_idx < len(self.data):
-                    price = self.data.iloc[self.current_idx]['AskPrice1']
-                else:
-                    price = self.get_current_price()
-                
-                if price is None:
-                    return False
-                    
-                volume = -self.current_pos
-                self.target_pos = 0
-                if reason:
-                    self.set_signal_reason(reason)
-                self._update_pos(log_callback)
-                
-                # 记录交易
-                self.add_trade("平空", price, volume, reason)
-                
-                if log_callback and debug_mode:
-                    log_callback(f"{self.symbol} {self.kline_period} 市价平仓: 平空 {volume}手 成交价:{price:.2f} 原因:{reason}")
-                
-                return True
-            else:
-                return self.buycover(volume=None, reason=reason, log_callback=log_callback, order_type=order_type)
+            return self.buycover(volume=None, reason=reason, log_callback=log_callback, order_type=order_type)
         return True  # 已经没有持仓
     
     # 数据访问方法

@@ -24,6 +24,46 @@ def _get_contract_params(symbol: str) -> dict:
     return _contract_service(symbol)
 
 
+def _resolve_continuous_symbol_for_live(symbol: str) -> str:
+    """
+    SIMNOW/实盘：将 rb888、rb777 等连续合约代码解析为交易所当前实际合约（用于 CTP 订阅与下单）。
+    解析失败或网络不可用时保留原代码并打印警告。
+    """
+    if not symbol or not isinstance(symbol, str):
+        return symbol
+    try:
+        from ..data.contract_mapper import ContractMapper
+        if not ContractMapper.is_continuous(symbol):
+            return symbol
+        params = _get_contract_params(symbol)
+        if not params:
+            return symbol
+        actual = params.get('actual_symbol') or symbol
+        if actual and actual.strip() and actual.lower() != symbol.lower():
+            print(f"[实盘配置] 连续合约 {symbol} -> {actual}（CTP 订阅/下单使用实际合约）")
+            return actual.strip()
+    except Exception as e:
+        print(f"[实盘配置] 连续合约解析失败，保留 {symbol}: {e}")
+    return symbol
+
+
+def _apply_live_continuous_symbol_resolution(mode: RunMode, config: dict) -> None:
+    """原地修改 config：仅 SIMNOW/实盘 将 symbol / data_sources[].symbol 中的主连转为实际合约。"""
+    if mode not in (RunMode.SIMNOW, RunMode.REAL_TRADING):
+        return
+    if config.get('resolve_continuous_live') is False:
+        return
+    sym = config.get('symbol')
+    if sym:
+        config['symbol'] = _resolve_continuous_symbol_for_live(sym)
+    sources = config.get('data_sources')
+    if isinstance(sources, list):
+        for ds in sources:
+            if isinstance(ds, dict) and ds.get('symbol'):
+                old = ds['symbol']
+                ds['symbol'] = _resolve_continuous_symbol_for_live(old)
+
+
 # ========== 远程数据API认证 quant789.com(松鼠俱乐部会员) ========== 小松鼠VX：viquant01
 API_USERNAME = ""              # 鉴权账号 (您的俱乐部手机号或邮箱)
 API_PASSWORD = ""            # 鉴权密码 
@@ -32,8 +72,9 @@ API_PASSWORD = ""            # 鉴权密码
 # 复权数据处理策略:
 #   - data_server（远程服务器）只存储不复权(raw)数据
 #   - 从 data_server 获取数据后，由框架本地进行复权计算
-#   - 本地复权算法位于: ssquant/data/local_adjust.py（当前为占位直通，后续实现）
-ENABLE_REMOTE_ADJUST = False
+#   - 本地复权算法位于: ssquant/data/local_adjust.py
+#   - adjust_type: '0'=不复权, '1'=后复权, '2'=前复权
+ENABLE_REMOTE_ADJUST = True
 
 
 # ========== 回测默认配置 ==========
@@ -47,7 +88,7 @@ BACKTEST_DEFAULTS = {
     'contract_multiplier': 10,      # 合约乘数 (吨/手)
     'price_tick': 1.0,              # 最小变动价位 (元)
     'slippage_ticks': 1,            # 滑点跳数
-    'adjust_type': '1',             # 复权类型: '0'不复权, '1'后复权
+    'adjust_type': '1',             # 复权类型: '0'不复权, '1'后复权, '2'前复权
     
     # -------- 数据对齐配置 (多数据源时使用) --------
     'align_data': False,            # 默认不开启，是否对齐多数据源的时间索引 (跨周期过滤策略需开启)
@@ -57,9 +98,11 @@ BACKTEST_DEFAULTS = {
     'lookback_bars': 0,           # K线回溯窗口大小，0表示不限制（返回全部历史数据），建议设置500-2000
     
     # -------- 缓存与调试 --------
-    'use_cache': False,              # 是否使用本地缓存数据
-    'save_data': False,              # 是否保存数据到本地缓存
+    'use_cache': True,              # 是否使用本地缓存数据
+    'save_data': True,              # 是否保存数据到本地缓存
     'debug': False,                 # 是否开启调试模式
+    # -------- 实盘 Tick 队列配置（回测中无影响，保留统一入口） --------
+    'tick_queue_maxsize': 20000,    # Tick处理队列最大长度。高频多品种建议 10000-50000
 }
 
 
@@ -89,7 +132,7 @@ ACCOUNTS = {
         'preload_history': True,          # 是否预加载历史K线
         'history_lookback_bars': 100,     # 预加载K线数量
         'lookback_bars': 0,               # K线/TICK缓存窗口大小，0表示使用默认值(1000条)，建议设置500-2000
-        'adjust_type': '1',               # 复权类型: '0'不复权, '1'后复权
+        'adjust_type': '1',               # 复权类型: '0'不复权, '1'后复权, '2'前复权
         # 'history_symbol': 'rb888',      # 自定义历史数据源 (默认自动推导为主力XXX888)
                                          # 跨期套利时可指定: 主力用'rb888', 次主力用'rb777'
         
@@ -98,6 +141,36 @@ ACCOUNTS = {
         
         # 回调配置
         'enable_tick_callback': False,     # 是否启用TICK回调 (实时行情推送)
+        # data_server + tick回调 节流间隔（秒）
+        # 仅 kline_source='data_server' 且 enable_tick_callback=True 时生效
+        # 作用：避免开盘tick洪峰导致队列积压/假死（多品种场景尤其明显）
+        # 设为 0 可关闭节流（每个tick都触发策略，适合需要逐tick止盈止损的策略）
+        'tick_callback_interval': 0.5,
+        # Tick队列容量（实盘高频保护）
+        # 建议:
+        #   - 低频/少品种: 5000-10000
+        #   - 中频/10~20品种: 15000-30000
+        #   - 高频/30+品种或夜盘活跃时段: 30000-50000
+        # 调大后更能抗瞬时洪峰，但会占用更多内存；如果日志中频繁出现
+        # “Tick队列已满/积压压缩”，优先从 20000 提升到 30000 或 50000。
+        'tick_queue_maxsize': 20000,
+        
+        # -------- 自动换月（仅 SIMNOW/实盘；回测不支持，勿在 RunMode.BACKTEST 里依赖）--------
+        # auto_roll_mode：发单节奏（与 reopen 不冲突）。'simultaneous'=同一次策略回调里连发委托、不等上一笔成交；
+        #   reopen=True 时先发平旧再发开新（两笔）；reopen=False 时只发平旧（一笔）。
+        # 'sequential'=先只发平旧，旧腿平仓闭环后再发开新（reopen=False 时仅平旧）；适合希望开新晚于平旧成交的场景。
+        # 用法：get_config(..., auto_roll_enabled=True, auto_roll_mode='simultaneous' 或 'sequential')；
+        #       多品种可在 data_sources[] 里对某一品种单独写 auto_roll_*。
+        'auto_roll_enabled': False,       # True=框架在策略前自动移仓；False=不启用
+        'auto_roll_mode': 'simultaneous', # 见上，一般保持 'simultaneous'
+        'auto_roll_reopen': True,         # 是否在新主力补回仓位；与 mode 分工不同，见上段
+        'auto_roll_order_type': 'next_bar_open',  # 移仓下单方式，与策略里 order_type 含义一致
+        'auto_roll_close_offset_ticks': None,     # 平旧限价跳数；None=用上面 order_offset_ticks
+        'auto_roll_open_offset_ticks': None,      # 开新限价跳数；None=用上面 order_offset_ticks
+        'auto_roll_verify_timeout_bars': 500,     # 移仓后闭环超时（策略调用次数上限，超时重置防死循环）
+        'auto_roll_log_enabled': True,    # True=写移仓专用本地日志（复盘）；False=不写
+        'auto_roll_log_dir': None,         # 日志目录；None=默认 ./live_data/rollover_logs（可写绝对路径）
+        'auto_roll_log_jsonl': False,      # True=同时写 jsonl 便于程序解析
         
         # 数据保存配置 (默认全部关闭)
         'save_kline_csv': False,           # 是否保存K线到CSV文件
@@ -134,7 +207,7 @@ ACCOUNTS = {
         'preload_history': True,          # 是否预加载历史K线
         'history_lookback_bars': 100,     # 预加载K线数量
         'lookback_bars': 0,               # K线/TICK缓存窗口大小，0表示使用默认值(1000条)，建议设置500-2000
-        'adjust_type': '1',               # 复权类型: '0'不复权, '1'后复权
+        'adjust_type': '1',               # 复权类型: '0'不复权, '1'后复权, '2'前复权
         # 'history_symbol': 'rb888',      # 自定义历史数据源 (默认自动推导为主力XXX888)
                                          # 跨期套利时可指定: 主力用'rb888', 次主力用'rb777'
         
@@ -143,6 +216,28 @@ ACCOUNTS = {
         
         # 回调配置
         'enable_tick_callback': False,     # 是否启用TICK回调 (实时行情推送)
+        # data_server + tick回调 节流间隔（秒）
+        # 仅 kline_source='data_server' 且 enable_tick_callback=True 时生效
+        # 作用：避免开盘tick洪峰导致队列积压/假死（多品种场景尤其明显）
+        # 设为 0 可关闭节流（每个tick都触发策略，适合需要逐tick止盈止损的策略）
+        'tick_callback_interval': 0.5,
+        # Tick队列容量（实盘高频保护）
+        # 推荐先用 20000；若云服务器 CPU 足够、品种较多、夜盘高频活跃，
+        # 可上调到 30000-50000。若内存紧张或品种少，可降到 10000。
+        'tick_queue_maxsize': 20000,
+        
+        # -------- 自动换月（仅实盘；回测不支持）--------
+        # auto_roll_mode / auto_roll_reopen：与 simnow 段说明相同（发单节奏 vs 是否补开新仓）。
+        'auto_roll_enabled': False,       # True=框架策略前自动移仓；False=不启用
+        'auto_roll_mode': 'simultaneous', # 见 simnow 段
+        'auto_roll_reopen': True,         # 见 simnow 段
+        'auto_roll_order_type': 'next_bar_open',  # 移仓委托类型
+        'auto_roll_close_offset_ticks': None,     # 平旧跳数；None=用 order_offset_ticks
+        'auto_roll_open_offset_ticks': None,      # 开新跳数；None=用 order_offset_ticks
+        'auto_roll_verify_timeout_bars': 500,     # 闭环等待上限（策略调用次数）
+        'auto_roll_log_enabled': True,    # True=写移仓本地日志便于审计复盘
+        'auto_roll_log_dir': None,         # 日志目录；None=默认 live_data/rollover_logs
+        'auto_roll_log_jsonl': False,      # True=额外 jsonl 行格式
         
         # 数据保存配置 (默认全部关闭)
         'save_kline_csv': False,          # 是否保存K线到CSV文件
@@ -177,6 +272,11 @@ def get_config(mode: RunMode, account: str = None, auto_params: bool = True, **o
                        - 不指定: 自动推导为主力连续(XXX888)
                        - 'rb888': 主力连续
                        - 'rb777': 次主力连续
+        
+        SIMNOW/实盘 专用:
+        resolve_continuous_live: 默认 True。为 True 时，symbol / data_sources[].symbol 中的
+            XXX888、XXX777 会先解析为 contract_info 中的当前实际合约再用于 CTP（订阅/下单）。
+            设为 False 可关闭替换（一般无需关闭）。
         
         数据请求参数（回测模式，三选一可组合）:
         start_date: 开始日期 'YYYY-MM-DD'
@@ -223,7 +323,12 @@ def get_config(mode: RunMode, account: str = None, auto_params: bool = True, **o
     # 应用用户覆盖参数
     config.update(overrides)
     
+    # SIMNOW/实盘：配置中写 rb888、rb777 时替换为当前主力/次主力实际合约（CTP 需真实 InstrumentID）
+    _apply_live_continuous_symbol_resolution(mode, config)
+    
     # 如果启用了 data_server K线模式，自动填充连接配置
+    # 默认包含 _server_config.DATA_SERVER（含 ws_url/api_url/fallback_servers 主备轮询）
+    # 账户里可只覆盖部分键；若需自定义备选，在 data_server 中提供 fallback_servers 列表
     if config.get('kline_source') == 'data_server':
         from ._server_config import DATA_SERVER as _DS
         if 'data_server' not in config:

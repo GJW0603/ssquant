@@ -588,14 +588,14 @@ class HTMLReportGenerator:
             }});
         }});
         
-        // 添加综合毛利润曲线（不含成本，黄色虚线）
+        // 添加综合交易盈亏曲线（未扣手续费，黄色虚线）
         if (combinedGrossProfitData.dates && combinedGrossProfitData.dates.length > 0) {{
             profitTraces.push({{
                 x: combinedGrossProfitData.dates,
                 y: combinedGrossProfitData.values,
                 type: 'scatter',
                 mode: 'lines',
-                name: '毛利润(不含成本)',
+                name: '交易盈亏(未扣手续费)',
                 line: {{
                     color: '#ffd54f',
                     width: 2,
@@ -605,14 +605,14 @@ class HTMLReportGenerator:
             }});
         }}
         
-        // 添加综合净利润曲线（含成本，白色实线）
+        // 添加综合净利润曲线（扣除手续费，白色实线）
         if (combinedProfitData.dates && combinedProfitData.dates.length > 0) {{
             profitTraces.push({{
                 x: combinedProfitData.dates,
                 y: combinedProfitData.values,
                 type: 'scatter',
                 mode: 'lines',
-                name: '净利润(扣除成本)',
+                name: '净利润(扣除手续费)',
                 line: {{
                     color: '#ffffff',
                     width: 2.5
@@ -946,7 +946,7 @@ class HTMLReportGenerator:
                     hoverinfo: 'text+x'
                 }});
             }}
-            
+
             var layout = {{
                 paper_bgcolor: 'rgba(0,0,0,0)',
                 plot_bgcolor: 'rgba(0,0,0,0)',
@@ -1286,7 +1286,7 @@ class HTMLReportGenerator:
         # 计算综合利润曲线（净利润：扣除成本）
         combined_profit_data = self._get_combined_profit_data(filtered_results)
         
-        # 计算综合毛利润曲线（不扣除成本）
+        # 计算综合交易盈亏曲线（未扣手续费）
         combined_gross_profit_data = self._get_combined_gross_profit_data(filtered_results)
         
         # 获取价格曲线数据（用于右侧Y轴显示）
@@ -1543,7 +1543,7 @@ class HTMLReportGenerator:
         return {'dates': dates, 'values': values}
     
     def _get_combined_gross_profit_data(self, results: Dict) -> Dict:
-        """获取综合毛利润曲线数据（不扣除成本）"""
+        """获取综合交易盈亏曲线数据（未扣手续费）"""
         all_gross_curves = []
         
         for key, result in results.items():
@@ -1555,7 +1555,7 @@ class HTMLReportGenerator:
         if not all_gross_curves:
             return {'dates': [], 'values': []}
         
-        # 合并毛利润曲线
+        # 合并交易盈亏曲线
         if len(all_gross_curves) == 1:
             combined = all_gross_curves[0]
         else:
@@ -2020,10 +2020,10 @@ class HTMLReportGenerator:
             ('initial_capital', '初始资金', ',.0f', 'neutral'),
             ('final_equity', '期末权益', ',.0f', None),
             ('total_return', '总收益率', '+.2f', None, '%'),
-            ('total_amount_profit', '毛利润(不含成本)', ',.2f', None),
+            ('total_amount_profit', '交易盈亏(未扣手续费)', ',.2f', None),
             ('total_commission', '总手续费', ',.2f', 'neutral'),
             ('total_slippage', '总滑点成本', ',.2f', 'neutral'),
-            ('total_net_profit', '净利润(扣除成本)', ',.2f', None),
+            ('total_net_profit', '净利润(扣除手续费)', ',.2f', None),
             ('total_trades', '总交易次数', 'd', 'neutral'),
             ('win_rate', '胜率', '.2f', None, '%'),
             ('max_drawdown_pct', '最大回撤', '.2f', 'negative', '%'),

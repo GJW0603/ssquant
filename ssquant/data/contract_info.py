@@ -109,7 +109,7 @@ class ContractInfoService:
         """从远程 API 获取"""
         try:
             print(f"[合约信息] 正在从远程获取合约数据...")
-            response = requests.get(CONTRACT_API_URL, timeout=30)
+            response = requests.get(CONTRACT_API_URL, timeout=180)
             response.raise_for_status()
             
             data = response.json()

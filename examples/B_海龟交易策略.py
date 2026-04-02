@@ -14,6 +14,19 @@
 出场信号:
 - 多头持仓，价格跌破10日最低价，平多
 - 空头持仓，价格突破10日最高价，平空
+
+合约代码 symbol 怎么填：
+  回测：品种+888 = 主力连续合约，用于拉取连续K线（如 au888、rb888）
+  SIMNOW / 实盘（自动主力映射）：
+    au888  → 自动映射为当前主力月份（如 au888→au2508），用于CTP订阅和下单
+    au777  → 自动映射为次主力月份
+    au2508 → 指定月份，直接使用，不做映射
+
+自动移仓（仅 SIMNOW/实盘）：持仓过主力换月时，开启 auto_roll_enabled=True 即可自动平旧开新
+合约参数（乘数、最小变动价、手续费等）自动获取，无需手动填写
+复权 adjust_type：'0'=不复权  '1'=后复权  '2'=前复权
+K线来源 kline_source（仅 SIMNOW/实盘）：'local'=本地CTP Tick合成（默认）  'data_server'=远程推送
+账户配置：在 trading_config.py 的 ACCOUNTS 中填写CTP账号信息
 """
 from ssquant.api.strategy_api import StrategyAPI
 from ssquant.backtest.unified_runner import UnifiedStrategyRunner, RunMode
@@ -82,38 +95,41 @@ def calculate_atr(high_series, low_series, close_series, period=14):
     
     return atr
 
-def calculate_position_size(price, atr, account_size, risk_factor, contract_multiplier):
+def calculate_position_size(price, atr, account_size, risk_factor, contract_multiplier,
+                            margin_rate=0.10, current_pos=0):
     """
-    计算头寸规模
-    
+    计算头寸规模（含保证金约束）
+
     Args:
         price: 当前价格
         atr: 当前ATR值
         account_size: 账户规模
         risk_factor: 风险因子
         contract_multiplier: 合约乘数
-        
+        margin_rate: 保证金率（默认 10%）
+        current_pos: 当前已持仓手数（绝对值），用于计算剩余可用资金
+
     Returns:
-        头寸数量
+        头寸数量（int），如果资金不足返回 0
     """
-    # 计算每点价值
     dollar_per_point = contract_multiplier
-    
-    # 计算波动价值
     volatility_value = atr * dollar_per_point
-    
-    # 计算风险金额
     risk_amount = account_size * risk_factor
-    
-    # 计算头寸数量
+
     position_size = risk_amount / volatility_value
-    
-    # 向下取整
-    position_size = np.floor(position_size)
-    
-    # 确保至少为1
-    position_size = max(1, position_size)
-    
+    position_size = int(np.floor(position_size))
+
+    if position_size <= 0:
+        return 0
+
+    margin_per_lot = price * contract_multiplier * margin_rate
+    if margin_per_lot <= 0:
+        return max(1, position_size)
+
+    max_total_lots = int(np.floor(account_size / margin_per_lot))
+    available_lots = max(0, max_total_lots - abs(current_pos))
+
+    position_size = min(position_size, available_lots)
     return position_size
 
 def turtle_trading_strategy(api: StrategyAPI):
@@ -137,6 +153,7 @@ def turtle_trading_strategy(api: StrategyAPI):
     atr_period = api.get_param('atr_period', 14)        # ATR周期
     risk_factor = api.get_param('risk_factor', 0.01)    # 风险因子
     max_units = api.get_param('max_units', 4)           # 最大系统单位数
+    margin_rate = api.get_param('margin_rate', 0.10)    # 保证金率
     
     # 获取数据源数量
     data_sources_count = api.get_data_sources_count()
@@ -210,35 +227,47 @@ def turtle_trading_strategy(api: StrategyAPI):
         account_size = symbol_config.get('initial_capital', 100000.0)
         contract_multiplier = symbol_config.get('contract_multiplier', 10)
         
-        # 计算单个系统单位的头寸规模
-        unit_size = calculate_position_size(current_price, current_atr, account_size, risk_factor, contract_multiplier)
-        
         # 获取当前持仓
         current_pos = api.get_pos(i)
         
-        # 计算当前系统单位数（绝对值）
-        current_units = abs(current_pos) / unit_size if unit_size > 0 else 0
+        # 计算单个系统单位的头寸规模（含保证金约束）
+        unit_size = calculate_position_size(
+            current_price, current_atr, account_size, risk_factor,
+            contract_multiplier, margin_rate, abs(current_pos)
+        )
         
+        # 计算当前系统单位数（绝对值）
+        current_units = abs(current_pos) / max(unit_size, 1) if unit_size > 0 else abs(current_pos)
+        
+        margin_per_lot = current_price * contract_multiplier * margin_rate
+        max_total_lots = int(np.floor(account_size / margin_per_lot)) if margin_per_lot > 0 else 0
+
         # 定期打印状态（使用数据长度判断，避免频繁输出）
         if data_len % 100 == 0:
             api.log(f"品种 {symbol} - 数据量: {data_len}, 价格: {current_price:.2f}, ATR: {current_atr:.2f}")
             api.log(f"入场通道: 上轨={current_entry_upper:.2f}, 下轨={current_entry_lower:.2f}")
             api.log(f"出场通道: 上轨={current_exit_upper:.2f}, 下轨={current_exit_lower:.2f}")
             api.log(f"单个系统单位规模: {unit_size}, 当前单位数: {current_units:.2f}/{max_units}")
-            api.log(f"当前持仓: {current_pos}")
+            api.log(f"保证金/手: {margin_per_lot:.0f}, 最大可开: {max_total_lots}, 当前持仓: {current_pos}")
         
         # 交易逻辑
         # 情况1: 当前无持仓
         if current_pos == 0:
             # 检查是否突破入场通道上轨（做多信号）
             if current_price > prev_entry_upper:
-                api.log(f"品种 {symbol} 价格 {current_price:.2f} 突破入场通道上轨 {prev_entry_upper:.2f}，开多仓 1个单位 ({unit_size})")
-                api.buy(volume=int(unit_size), order_type='next_bar_open', index=i)
+                if unit_size > 0:
+                    api.log(f"品种 {symbol} 价格 {current_price:.2f} 突破入场通道上轨 {prev_entry_upper:.2f}，开多仓 1个单位 ({unit_size})")
+                    api.buy(volume=int(unit_size), order_type='next_bar_open', index=i)
+                else:
+                    api.log(f"品种 {symbol} 多头信号触发，但保证金不足，跳过开仓")
                 
             # 检查是否突破入场通道下轨（做空信号）
             elif current_price < prev_entry_lower:
-                api.log(f"品种 {symbol} 价格 {current_price:.2f} 突破入场通道下轨 {prev_entry_lower:.2f}，开空仓 1个单位 ({unit_size})")
-                api.sellshort(volume=int(unit_size), order_type='next_bar_open', index=i)
+                if unit_size > 0:
+                    api.log(f"品种 {symbol} 价格 {current_price:.2f} 突破入场通道下轨 {prev_entry_lower:.2f}，开空仓 1个单位 ({unit_size})")
+                    api.sellshort(volume=int(unit_size), order_type='next_bar_open', index=i)
+                else:
+                    api.log(f"品种 {symbol} 空头信号触发，但保证金不足，跳过开仓")
         
         # 情况2: 当前持有多仓
         elif current_pos > 0:
@@ -248,11 +277,8 @@ def turtle_trading_strategy(api: StrategyAPI):
                 api.sell(order_type='next_bar_open', index=i)
             
             # 检查是否可以加仓（价格上涨0.5个ATR且未达到最大单位数）
-            elif current_units < max_units:
-                # 获取最近一次加仓价格
+            elif current_units < max_units and unit_size > 0:
                 last_entry_price = current_price - current_atr
-                
-                # 如果价格上涨了0.5个ATR，可以加仓
                 if current_price >= last_entry_price + 0.5 * current_atr:
                     new_unit_size = int(unit_size)
                     if new_unit_size > 0:
@@ -267,11 +293,8 @@ def turtle_trading_strategy(api: StrategyAPI):
                 api.buycover(order_type='next_bar_open', index=i)
             
             # 检查是否可以加仓（价格下跌0.5个ATR且未达到最大单位数）
-            elif current_units < max_units:
-                # 获取最近一次加仓价格
+            elif current_units < max_units and unit_size > 0:
                 last_entry_price = current_price + current_atr
-                
-                # 如果价格下跌了0.5个ATR，可以加仓
                 if current_price <= last_entry_price - 0.5 * current_atr:
                     new_unit_size = int(unit_size)
                     if new_unit_size > 0:
@@ -291,6 +314,7 @@ if __name__ == "__main__":
         'atr_period': 14,
         'risk_factor': 0.01,
         'max_units': 4,
+        'margin_rate': 0.10,        # 保证金率（默认10%，根据品种调整）
     }
     
     # ========== 获取基础配置 ==========
@@ -298,11 +322,11 @@ if __name__ == "__main__":
         # ==================== 回测配置 ====================
         config = get_config(RUN_MODE,
             # -------- 基础配置 --------
-            symbol='au888',                   # 合约代码
-            start_date='2025-12-01',          # 回测开始日期
+            symbol='rb888',                   # 品种+888 = 主力连续合约（回测时用于拉取连续K线）
+            start_date='2025-01-01',          # 回测开始日期
             end_date='2026-01-31',            # 回测结束日期
-            kline_period='1m',                # K线周期
-            adjust_type='1',                  # 复权类型
+            kline_period='15m',                # K线周期
+            adjust_type='1',                  # 复权: '0'不复权  '1'后复权  '2'前复权
             
             # -------- 合约参数（自动获取，无需手动填写）--------
             # price_tick=自动,                # 最小变动价位（自动从远程获取）
@@ -325,29 +349,38 @@ if __name__ == "__main__":
             account='simnow_default',         # 账户名称
             server_name='电信1',              # 服务器: 电信1/电信2/移动/TEST(盘后测试)
 
-            # -------- K线数据源（可选）--------
-            # 默认 'local': 本地 CTP Tick 实时聚合K线
-            # 切换 'data_server': K线由 data_server WebSocket 推送（需 data_server 运行中）
-            #kline_source='data_server', #取消注释即可使用data_server推送的K线
+            # -------- K线数据来源 --------
+            # 'local' = 本地CTP Tick合成K线（默认）  'data_server' = 远程推送（需配置账号密码）
+            # kline_source='data_server',
 
-            # -------- 合约配置 --------
-            symbol='au2602',                  # 交易合约代码
+            # -------- 合约与周期 --------
+            # 合约代码写法：
+            #   au888  → 主力合约（自动映射为当前主力月份）
+            #   au777  → 次主力合约（同理自动映射）
+            #   au2508 → 指定月份（不做映射，直接使用）
+            symbol='au888',
             kline_period='1m',                # K线周期
             
-            # -------- 交易参数（price_tick 自动获取）--------
+            # -------- 下单参数 --------
             # price_tick=自动,                # 最小变动价位（自动从远程获取）
             order_offset_ticks=10,            # 委托偏移跳数
             
             # -------- 智能算法交易配置 --------
+            # 开启后，未成交的委托会自动撤单并以更优价格重新挂单
             algo_trading=False,               # 启用算法交易
             order_timeout=10,                 # 订单超时时间(秒)
             retry_limit=3,                    # 最大重试次数
             retry_offset_ticks=5,             # 重试时的超价跳数
             
+            # -------- 自动移仓（主力合约换月）--------
+            # 开启后，主力切换时自动平旧→开新，适合中长线策略
+            auto_roll_enabled=False,           # 是否启用自动移仓
+            auto_roll_reopen=True,             # 平旧仓后是否自动在新主力上补开仓位
+            
             # -------- 历史数据配置 --------
             preload_history=True,             # 预加载历史K线 (海龟策略需要55周期)
             history_lookback_bars=200,        # 预加载数量 (建议200根以上)
-            adjust_type='1',                  # 复权类型
+            adjust_type='1',                  # 复权: '0'不复权  '1'后复权  '2'前复权
             
             # -------- 数据窗口配置 --------
             lookback_bars=500,                # K线/TICK回溯窗口 (0=不限制，策略get_klines返回的最大条数)
@@ -368,29 +401,35 @@ if __name__ == "__main__":
             # -------- 账户配置 --------
             account='real_default',           # 账户名称
             
-            # -------- K线数据源（可选）--------
-            # 默认 'local': 本地 CTP Tick 实时聚合K线
-            # 切换 'data_server': K线由 data_server WebSocket 推送（需 data_server 运行中）
-            #kline_source='data_server', #取消注释即可使用data_server推送的K线
+            # -------- K线数据源 --------
+            # 'local' = 本地CTP Tick合成K线（默认）  'data_server' = 远程推送（需配置账号密码）
+            # kline_source='data_server',
             
-            # -------- 合约配置 --------
-            symbol='au2602',                  # 交易合约代码
+            # -------- 合约与周期 --------
+            # 合约代码写法（与SIMNOW相同）
+            symbol='au888',
             kline_period='1m',                # K线周期
             
-            # -------- 交易参数（price_tick 自动获取）--------
+            # -------- 下单参数 --------
             # price_tick=自动,                # 最小变动价位（自动从远程获取）
             order_offset_ticks=10,            # 委托偏移跳数
             
             # -------- 智能算法交易配置 --------
+            # 开启后，未成交的委托会自动撤单并以更优价格重新挂单
             algo_trading=False,               # 启用算法交易
             order_timeout=10,                 # 订单超时时间(秒)
             retry_limit=3,                    # 最大重试次数
             retry_offset_ticks=5,             # 重试时的超价跳数
             
+            # -------- 自动移仓（主力合约换月）--------
+            # 开启后，主力切换时自动平旧→开新，适合中长线策略
+            auto_roll_enabled=False,           # 是否启用自动移仓
+            auto_roll_reopen=True,             # 平旧仓后是否自动在新主力上补开仓位
+            
             # -------- 历史数据配置 --------
             preload_history=True,             # 预加载历史K线
             history_lookback_bars=200,        # 预加载数量
-            adjust_type='1',                  # 复权类型
+            adjust_type='1',                  # 复权: '0'不复权  '1'后复权  '2'前复权
             
             # -------- 数据窗口配置 --------
             lookback_bars=500,                # K线/TICK回溯窗口 (0=不限制，策略get_klines返回的最大条数)

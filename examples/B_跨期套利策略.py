@@ -21,6 +21,19 @@
 SIMNOW/实盘的 data_sources 中如需手动指定参数，请取消注释:
     'price_tick': 1,              # 手动指定最小变动价位
     'contract_multiplier': 10,    # 手动指定合约乘数
+
+合约代码 symbol 怎么填：
+  回测：品种+888 = 主力连续合约，用于拉取连续K线（如 au888、rb888）
+  SIMNOW / 实盘（自动主力映射）：
+    au888  → 自动映射为当前主力月份（如 au888→au2508），用于CTP订阅和下单
+    au777  → 自动映射为次主力月份
+    au2508 → 指定月份，直接使用，不做映射
+
+自动移仓（仅 SIMNOW/实盘）：持仓过主力换月时，开启 auto_roll_enabled=True 即可自动平旧开新
+合约参数（乘数、最小变动价、手续费等）自动获取，无需手动填写
+复权 adjust_type：'0'=不复权  '1'=后复权  '2'=前复权
+K线来源 kline_source（仅 SIMNOW/实盘）：'local'=本地CTP Tick合成（默认）  'data_server'=远程推送
+账户配置：在 trading_config.py 的 ACCOUNTS 中填写CTP账号信息
 """
 from ssquant.api.strategy_api import StrategyAPI
 from ssquant.backtest.unified_runner import UnifiedStrategyRunner, RunMode
@@ -212,22 +225,20 @@ if __name__ == "__main__":
             # -------- 数据窗口配置 --------
             lookback_bars=500,                # K线回溯窗口 (0=不限制，策略get_klines返回的最大条数)
             
-            # -------- 跨期套利数据源配置 (同品种不同月份) --------
-            # 888=主力连续, 777=次主力连续
-            # 注：data_sources 中的 price_tick/contract_multiplier 自动获取
+            # -------- 跨期套利 data_sources --------
             data_sources=[
-                {   # 数据源0: 近月合约 (主力连续)
-                    'symbol': 'rb888',        # 合约代码 (888=主力连续)
+                {   # 数据源0: 近月
+                    'symbol': 'rb888',        # 品种+888 = 主力连续合约（回测时用于拉取连续K线）
                     'kline_period': '1m',     # K线周期
-                    'adjust_type': '1',       # 复权类型: '0'不复权, '1'后复权
+                    'adjust_type': '1',       # 复权: '0'不复权  '1'后复权  '2'前复权
                     # 'price_tick': 自动,     # 最小变动价位（自动获取）
                     # 'contract_multiplier': 自动,  # 合约乘数（自动获取）
                     'slippage_ticks': 1,      # 滑点跳数
                 },
-                {   # 数据源1: 远月合约 (次主力连续)
-                    'symbol': 'rb777',        # 合约代码 (777=次主力连续)
+                {   # 数据源1: 远月
+                    'symbol': 'rb777',        # 品种+777 = 次主力连续合约（回测时用于拉取连续K线）
                     'kline_period': '1m',     # K线周期
-                    'adjust_type': '1',       # 复权类型
+                    'adjust_type': '1',       # 复权: '0'不复权  '1'后复权  '2'前复权
                     # 'price_tick': 自动,     # 最小变动价位（自动获取）
                     # 'contract_multiplier': 自动,  # 合约乘数（自动获取）
                     'slippage_ticks': 1,      # 滑点跳数
@@ -242,18 +253,16 @@ if __name__ == "__main__":
             account='simnow_default',         # 账户名称
             server_name='电信1',              # 服务器: 电信1/电信2/移动/TEST(盘后测试)
             
-            # -------- K线数据源（可选）--------
-            # 默认 'local': 本地 CTP Tick 实时聚合K线
-            # 切换 'data_server': K线由 data_server WebSocket 推送（需 data_server 运行中）
-            #kline_source='data_server', #取消注释即可使用data_server推送的K线
+            # -------- K线数据来源 --------
+            # 'local' = 本地CTP Tick合成K线（默认）  'data_server' = 远程推送（需配置账号密码）
+            # kline_source='data_server',
             
-            # -------- 跨期套利配置 --------
-            # ⭐ 关键：使用 history_symbol 指定历史数据来源
-            # 近月用主力数据(rb888)，远月用次主力数据(rb777)
-            # 注：price_tick 自动获取，如需手动指定请取消注释
+            # -------- 合约与周期 --------
+            # 合约代码写法：
+            #   rb888 → 主力合约（自动映射）  rb777 → 次主力  rb2508 → 指定月份
             data_sources=[
-                {   # 数据源0: 近月合约（主力）
-                    'symbol': 'rb2601',           # 合约代码 (近月合约)
+                {   # 数据源0: 近月（主力连）
+                    'symbol': 'rb888',          # 主力合约（自动映射）
                     'kline_period': '1m',         # K线周期
                     # 'price_tick': 1,            # 最小变动价位（自动获取，手动指定请取消注释）
                     'order_offset_ticks': 5,      # 下单偏移跳数 (挂单距离)
@@ -265,11 +274,11 @@ if __name__ == "__main__":
                     
                     'preload_history': True,      # 是否预加载历史数据
                     'history_lookback_bars': 200, # 预加载K线数量
-                    'adjust_type': '1',           # 复权类型: '0'不复权, '1'后复权
+                    'adjust_type': '1',           # 复权: '0'不复权  '1'后复权  '2'前复权
                     'history_symbol': 'rb888',    # 历史数据来源 (主力连续)
                 },
-                {   # 数据源1: 远月合约（次主力）
-                    'symbol': 'rb2605',           # 合约代码 (远月合约)
+                {   # 数据源1: 远月（次主力连）
+                    'symbol': 'rb777',          # 次主力合约（自动映射）
                     'kline_period': '1m',         # K线周期
                     # 'price_tick': 1,            # 最小变动价位（自动获取，手动指定请取消注释）
                     'order_offset_ticks': 5,      # 下单偏移跳数
@@ -281,10 +290,15 @@ if __name__ == "__main__":
                     
                     'preload_history': True,      # 预加载历史数据
                     'history_lookback_bars': 200, # 预加载K线数量
-                    'adjust_type': '1',           # 复权类型
+                    'adjust_type': '1',           # 复权: '0'不复权  '1'后复权  '2'前复权
                     'history_symbol': 'rb777',    # 历史数据来源 (次主力连续)
                 },
             ],
+            
+            # -------- 自动移仓（主力合约换月）--------
+            # 开启后，主力切换时自动平旧→开新，适合中长线策略
+            auto_roll_enabled=False,           # 是否启用自动移仓
+            auto_roll_reopen=True,             # 平旧仓后是否自动在新主力上补开仓位
             
             # -------- 数据窗口配置 --------
             lookback_bars=500,                # K线回溯窗口 (0=不限制，策略get_klines返回的最大条数)
@@ -305,17 +319,14 @@ if __name__ == "__main__":
             # -------- 账户配置 --------
             account='real_default',           # 账户名称 (对应trading_config.py中的配置)
             
-            # -------- K线数据源（可选）--------
-            # 默认 'local': 本地 CTP Tick 实时聚合K线
-            # 切换 'data_server': K线由 data_server WebSocket 推送（需 data_server 运行中）
-            #kline_source='data_server', #取消注释即可使用data_server推送的K线
+            # -------- K线数据来源 --------
+            # 'local' = 本地CTP Tick合成K线（默认）  'data_server' = 远程推送（需配置账号密码）
+            # kline_source='data_server',
             
-            # -------- 跨期套利配置 --------
-            # ⭐ 关键：使用 history_symbol 指定历史数据来源
-            # 注：price_tick 自动获取，如需手动指定请取消注释
+            # -------- 合约与周期 --------
             data_sources=[
-                {   # 数据源0: 近月合约（主力）
-                    'symbol': 'rb2601',           # 合约代码 (近月合约)
+                {   # 数据源0: 近月（主力）
+                    'symbol': 'rb888',
                     'kline_period': '1m',         # K线周期
                     # 'price_tick': 1,            # 最小变动价位（自动获取，手动指定请取消注释）
                     'order_offset_ticks': 5,      # 下单偏移跳数 (挂单距离)
@@ -327,11 +338,11 @@ if __name__ == "__main__":
                     
                     'preload_history': True,      # 是否预加载历史数据
                     'history_lookback_bars': 200, # 预加载K线数量
-                    'adjust_type': '1',           # 复权类型: '0'不复权, '1'后复权
+                    'adjust_type': '1',           # 复权: '0'不复权  '1'后复权  '2'前复权
                     'history_symbol': 'rb888',    # 历史数据来源 (主力连续)
                 },
-                {   # 数据源1: 远月合约（次主力）
-                    'symbol': 'rb2605',           # 合约代码 (远月合约)
+                {   # 数据源1: 远月（次主力连）
+                    'symbol': 'rb777',          # 次主力合约（自动映射）
                     'kline_period': '1m',         # K线周期
                     # 'price_tick': 1,            # 最小变动价位（自动获取，手动指定请取消注释）
                     'order_offset_ticks': 5,      # 下单偏移跳数
@@ -343,10 +354,15 @@ if __name__ == "__main__":
                     
                     'preload_history': True,      # 预加载历史数据
                     'history_lookback_bars': 200, # 预加载K线数量
-                    'adjust_type': '1',           # 复权类型
+                    'adjust_type': '1',           # 复权: '0'不复权  '1'后复权  '2'前复权
                     'history_symbol': 'rb777',    # 历史数据来源 (次主力连续)
                 },
             ],
+            
+            # -------- 自动移仓（主力合约换月）--------
+            # 开启后，主力切换时自动平旧→开新，适合中长线策略
+            auto_roll_enabled=False,           # 是否启用自动移仓
+            auto_roll_reopen=True,             # 平旧仓后是否自动在新主力上补开仓位
             
             # -------- 数据窗口配置 --------
             lookback_bars=500,                # K线回溯窗口 (0=不限制，策略get_klines返回的最大条数)

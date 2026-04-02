@@ -76,6 +76,17 @@ class BacktestLogger:
         if self.log_file and not os.environ.get('NO_VISUALIZATION', '').lower() == 'true':
             with open(self.log_file, 'a', encoding='utf-8') as f:
                 f.write(log_message + "\n")
+
+    def log_important(self, message):
+        """记录关键提示：无论 debug 是否开启，都尽量输出到控制台。"""
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        log_message = f"[{timestamp}] {message}"
+
+        print(log_message)
+
+        if self.log_file and not os.environ.get('NO_VISUALIZATION', '').lower() == 'true':
+            with open(self.log_file, 'a', encoding='utf-8') as f:
+                f.write(log_message + "\n")
     
     def get_performance_file(self):
         """获取绩效报告文件路径"""

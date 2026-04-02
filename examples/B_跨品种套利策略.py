@@ -9,6 +9,19 @@
 1. 计算两个品种的价差
 2. 当价差偏离均值时开仓
 3. 当价差回归均值时平仓
+
+合约代码 symbol 怎么填：
+  回测：品种+888 = 主力连续合约，用于拉取连续K线（如 au888、rb888）
+  SIMNOW / 实盘（自动主力映射）：
+    au888  → 自动映射为当前主力月份（如 au888→au2508），用于CTP订阅和下单
+    au777  → 自动映射为次主力月份
+    au2508 → 指定月份，直接使用，不做映射
+
+自动移仓（仅 SIMNOW/实盘）：持仓过主力换月时，开启 auto_roll_enabled=True 即可自动平旧开新
+合约参数（乘数、最小变动价、手续费等）自动获取，无需手动填写
+复权 adjust_type：'0'=不复权  '1'=后复权  '2'=前复权
+K线来源 kline_source（仅 SIMNOW/实盘）：'local'=本地CTP Tick合成（默认）  'data_server'=远程推送
+账户配置：在 trading_config.py 的 ACCOUNTS 中填写CTP账号信息
 """
 from ssquant.api.strategy_api import StrategyAPI
 from ssquant.backtest.unified_runner import UnifiedStrategyRunner, RunMode
@@ -181,38 +194,32 @@ if __name__ == "__main__":
     if RUN_MODE == RunMode.BACKTEST:
         # ==================== 回测配置 (跨品种套利 - 螺纹钢vs铁矿石) ====================
         config = get_config(RUN_MODE,
-            # -------- 基础配置 --------
+            # -------- 合约与周期 --------
             start_date='2025-12-01',          # 回测开始日期
             end_date='2026-01-31',            # 回测结束日期
             initial_capital=100000,           # 初始资金 (元)
-            # commission=自动,                # 手续费率（自动从远程获取）
-            # margin_rate=自动,               # 保证金率（自动从远程获取）
+            # commission=0.0001,
+            # margin_rate=0.1,
             
             # -------- 数据对齐配置 (套利策略必须开启) --------
             align_data=True,                  # 是否对齐多数据源的时间索引
             fill_method='ffill',              # 缺失值填充方法: 'ffill'向前填充, 'bfill'向后填充
             
-            # -------- 数据窗口配置 --------
-            lookback_bars=500,                # K线回溯窗口 (0=不限制，策略get_klines返回的最大条数)
+            # -------- 数据窗口 --------
+            lookback_bars=500,                # 策略可回看的最大K线条数（0=不限制）
             
-            # -------- 跨品种套利数据源配置 (产业链相关品种) --------
-            # 螺纹钢与铁矿石存在产业链上下游关系
-            # 注：data_sources 中的 price_tick/contract_multiplier 自动获取
+            # -------- 跨品种 data_sources --------
             data_sources=[
-                {   # 数据源0: 螺纹钢主力连续
-                    'symbol': 'rb888',        # 合约代码 (888=主力连续)
+                {   # 数据源0: 螺纹钢
+                    'symbol': 'rb888',        # 品种+888 = 主力连续合约（回测时用于拉取连续K线）
                     'kline_period': '1m',     # K线周期
-                    'adjust_type': '1',       # 复权类型: '0'不复权, '1'后复权
-                    # 'price_tick': 自动,     # 最小变动价位（自动获取）
-                    # 'contract_multiplier': 自动,  # 合约乘数（自动获取）
+                    'adjust_type': '1',       # 复权: '0'不复权  '1'后复权  '2'前复权
                     'slippage_ticks': 1,      # 滑点跳数
                 },
-                {   # 数据源1: 铁矿石主力连续
-                    'symbol': 'i888',         # 合约代码
+                {   # 数据源1: 铁矿石
+                    'symbol': 'i888',         # 品种+888 = 主力连续合约（回测时用于拉取连续K线）
                     'kline_period': '1m',     # K线周期
-                    'adjust_type': '1',       # 复权类型
-                    # 'price_tick': 自动,     # 最小变动价位（自动获取）
-                    # 'contract_multiplier': 自动,  # 合约乘数（自动获取）
+                    'adjust_type': '1',       # 复权: '0'不复权  '1'后复权  '2'前复权
                     'slippage_ticks': 1,      # 滑点跳数
                 },
             ]
@@ -221,57 +228,64 @@ if __name__ == "__main__":
     elif RUN_MODE == RunMode.SIMNOW:
         # ==================== SIMNOW模拟配置 (跨品种套利) ====================
         config = get_config(RUN_MODE,
-            # -------- 账户配置 --------
+            # -------- 账户 --------
             account='simnow_default',         # 账户名称
             server_name='电信1',              # 服务器: 电信1/电信2/移动/TEST(盘后测试)
             
-            # -------- K线数据源（可选）--------
-            # 默认 'local': 本地 CTP Tick 实时聚合K线
-            # 切换 'data_server': K线由 data_server WebSocket 推送（需 data_server 运行中）
-            #kline_source='data_server', #取消注释即可使用data_server推送的K线
+            # -------- K线来源 --------
+            #kline_source='data_server',       # 默认 'local'（本地Tick合成K线）；取消注释切换为远程推送
             
-            # -------- 套利品种配置 --------
-            # 注：price_tick 自动获取，如需手动指定请取消注释
+            # -------- 跨品种 data_sources --------
             data_sources=[
                 {   # 数据源0: 螺纹钢
-                    'symbol': 'rb2601',           # 合约代码 (具体月份)
+                    'symbol': 'rb888',          # 品种+888 = 主力连续（如 rb888→rb2505）
                     'kline_period': '1m',         # K线周期
-                    # 'price_tick': 1,            # 最小变动价位（自动获取，手动指定请取消注释）
+                    # -------- 下单参数 --------
                     'order_offset_ticks': 5,      # 下单偏移跳数 (挂单距离)
                     
-                    'algo_trading': False,        # 智能交易开关
+                    # -------- 算法交易（智能追单）--------
+                    # 未成交时自动撤单重挂，逐步扩大偏移直到成交
+                    'algo_trading': False,        # 是否启用
                     'order_timeout': 10,          # 超时时间
                     'retry_limit': 3,             # 重试次数
                     'retry_offset_ticks': 5,      # 重试偏移
                     
+                    # -------- 历史数据预加载 --------
                     'preload_history': True,      # 是否预加载历史数据
                     'history_lookback_bars': 200, # 预加载K线数量
-                    'adjust_type': '1',           # 复权类型: '0'不复权, '1'后复权
+                    'adjust_type': '1',           # 复权: '0'不复权  '1'后复权  '2'前复权
                 },
                 {   # 数据源1: 铁矿石
-                    'symbol': 'i2601',            # 合约代码
+                    'symbol': 'i888',           # 品种+888 = 主力连续（如 i888→i2505）
                     'kline_period': '1m',         # K线周期
-                    # 'price_tick': 0.5,          # 最小变动价位（自动获取，手动指定请取消注释）
+                    # -------- 下单参数 --------
                     'order_offset_ticks': 10,     # 下单偏移跳数
                     
-                    'algo_trading': False,        # 智能交易开关
+                    # -------- 算法交易（智能追单）--------
+                    'algo_trading': False,        # 是否启用
                     'order_timeout': 10,          # 超时时间
                     'retry_limit': 3,             # 重试次数
                     'retry_offset_ticks': 5,      # 重试偏移
                     
-                    'preload_history': True,      # 预加载历史数据
+                    # -------- 历史数据预加载 --------
+                    'preload_history': True,      # 是否预加载历史数据
                     'history_lookback_bars': 200, # 预加载K线数量
-                    'adjust_type': '1',           # 复权类型
+                    'adjust_type': '1',           # 复权: '0'不复权  '1'后复权  '2'前复权
                 },
             ],
             
-            # -------- 数据窗口配置 --------
-            lookback_bars=500,                # K线回溯窗口 (0=不限制，策略get_klines返回的最大条数)
+            # -------- 自动移仓（主力合约换月）--------
+            # 开启后，主力切换时自动平旧→开新，适合中长线策略
+            auto_roll_enabled=False,           # 是否启用自动移仓
+            auto_roll_reopen=True,             # 平旧仓后是否自动在新主力上补开仓位
             
-            # -------- 回调模式配置 --------
-            enable_tick_callback=False,       # TICK回调: False=K线驱动, True=TICK驱动
+            # -------- 数据窗口 --------
+            lookback_bars=500,                # 策略可回看的最大K线条数（0=不限制）
             
-            # -------- 数据保存配置 --------
+            # -------- 回调模式 --------
+            enable_tick_callback=False,       # True=每个Tick触发  False=每根K线触发
+            
+            # -------- 数据保存 --------
             save_kline_csv=False,             # 保存K线到CSV文件
             save_kline_db=False,              # 保存K线到SQLite数据库
             save_tick_csv=False,              # 保存TICK到CSV文件
@@ -284,16 +298,14 @@ if __name__ == "__main__":
             # -------- 账户配置 --------
             account='real_default',           # 账户名称 (对应trading_config.py中的配置)
             
-            # -------- K线数据源（可选）--------
-            # 默认 'local': 本地 CTP Tick 实时聚合K线
-            # 切换 'data_server': K线由 data_server WebSocket 推送（需 data_server 运行中）
-            #kline_source='data_server', #取消注释即可使用data_server推送的K线
+            # -------- K线数据来源 --------
+            # 'local' = 本地CTP Tick合成K线（默认）  'data_server' = 远程推送（需配置账号密码）
+            # kline_source='data_server',
             
-            # -------- 套利品种配置 --------
-            # 注：price_tick 自动获取，如需手动指定请取消注释
+            # -------- 合约与周期 --------
             data_sources=[
                 {   # 数据源0: 螺纹钢
-                    'symbol': 'rb2601',           # 合约代码 (具体月份)
+                    'symbol': 'rb888',          # 主力合约（自动映射）
                     'kline_period': '1m',         # K线周期
                     # 'price_tick': 1,            # 最小变动价位（自动获取，手动指定请取消注释）
                     'order_offset_ticks': 5,      # 下单偏移跳数 (挂单距离)
@@ -305,10 +317,10 @@ if __name__ == "__main__":
                     
                     'preload_history': True,      # 是否预加载历史数据
                     'history_lookback_bars': 200, # 预加载K线数量
-                    'adjust_type': '1',           # 复权类型: '0'不复权, '1'后复权
+                    'adjust_type': '1',           # 复权: '0'不复权  '1'后复权  '2'前复权
                 },
                 {   # 数据源1: 铁矿石
-                    'symbol': 'i2601',            # 合约代码
+                    'symbol': 'i888',           # 主力合约（自动映射）
                     'kline_period': '1m',         # K线周期
                     # 'price_tick': 0.5,          # 最小变动价位（自动获取，手动指定请取消注释）
                     'order_offset_ticks': 10,     # 下单偏移跳数
@@ -320,9 +332,14 @@ if __name__ == "__main__":
                     
                     'preload_history': True,      # 预加载历史数据
                     'history_lookback_bars': 200, # 预加载K线数量
-                    'adjust_type': '1',           # 复权类型
+                    'adjust_type': '1',           # 复权: '0'不复权  '1'后复权  '2'前复权
                 },
             ],
+            
+            # -------- 自动移仓（主力合约换月）--------
+            # 开启后，主力切换时自动平旧→开新，适合中长线策略
+            auto_roll_enabled=False,           # 是否启用自动移仓
+            auto_roll_reopen=True,             # 平旧仓后是否自动在新主力上补开仓位
             
             # -------- 数据窗口配置 --------
             lookback_bars=500,                # K线回溯窗口 (0=不限制，策略get_klines返回的最大条数)

@@ -116,9 +116,15 @@ class BacktestResultCalculator:
         for i, ds in enumerate(multi_data_source.data_sources):
             # 获取交易记录
             trades = ds.trades
+            result_end_idx = int(getattr(ds, 'result_end_idx', len(ds.data)) or 0)
+            result_end_idx = max(0, min(result_end_idx, len(ds.data)))
+            effective_data = ds.data.iloc[:result_end_idx].copy() if result_end_idx > 0 else ds.data.iloc[0:0].copy()
             
             if not trades:
                 self.log(f"数据源 #{i} ({ds.symbol} {ds.kline_period}) 没有交易记录")
+                continue
+            if effective_data.empty:
+                self.log(f"数据源 #{i} ({ds.symbol} {ds.kline_period}) 没有可用于生成报告的回测区间")
                 continue
             
             # 获取品种配置
@@ -250,8 +256,8 @@ class BacktestResultCalculator:
                 profit_factor = float('inf') if avg_win > 0 else 0
             
             # 修改权益曲线计算方法，考虑持仓盈亏
-            equity_curve = pd.Series(float(initial_capital), index=ds.data.index, dtype=float)  # 净利润曲线（扣除所有成本）
-            gross_equity_curve = pd.Series(float(initial_capital), index=ds.data.index, dtype=float)  # 毛利润曲线（完全不扣除成本）
+            equity_curve = pd.Series(float(initial_capital), index=effective_data.index, dtype=float)  # 净利润曲线（扣除所有成本）
+            gross_equity_curve = pd.Series(float(initial_capital), index=effective_data.index, dtype=float)  # 毛利润曲线（完全不扣除成本）
             available_cash = initial_capital  # 可用资金（未被占用的资金）
             total_margin = 0  # 总保证金占用
             total_equity = initial_capital  # 总权益（可用资金 + 保证金 + 浮动盈亏）
@@ -269,8 +275,8 @@ class BacktestResultCalculator:
             sorted_trades = sorted(trades.copy(), key=lambda x: x['datetime'])
             
             # 遍历每个时间点
-            for i, date in enumerate(ds.data.index):
-                row = ds.data.iloc[i]
+            for i, date in enumerate(effective_data.index):
+                row = effective_data.iloc[i]
                 # K线数据使用close，TICK数据使用LastPrice
                 if 'close' in row:
                     current_price = row['close']
@@ -467,7 +473,7 @@ class BacktestResultCalculator:
             
             if not equity_curve.empty and len(equity_curve) > 1:
                 # 将权益曲线按日聚合（取每日最后一个值）
-                equity_with_date = pd.Series(equity_curve.values, index=ds.data.index[:len(equity_curve)])
+                equity_with_date = pd.Series(equity_curve.values, index=effective_data.index[:len(equity_curve)])
                 daily_equity = equity_with_date.resample('D').last().dropna()
                 
                 if len(daily_equity) > 1:
@@ -523,7 +529,7 @@ class BacktestResultCalculator:
                 'annual_return': annual_return,
                 'sharpe_ratio': sharpe_ratio,
                 'trades': trades,
-                'data': ds.data,
+                'data': effective_data,
                 'equity_curve': equity_curve,
                 'gross_equity_curve': gross_equity_curve  # 毛利润曲线（不扣除成本）
             }
