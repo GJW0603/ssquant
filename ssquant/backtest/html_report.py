@@ -947,6 +947,45 @@ class HTMLReportGenerator:
                 }});
             }}
 
+            // 反手：平多开空（与单笔「平多开空」或 平多+开空 合并腿一致）
+            var fs = source.flip_short_markers || {{ x: [], y: [], text: [] }};
+            if (fs.x && fs.x.length > 0) {{
+                traces.push({{
+                    x: fs.x,
+                    y: fs.y,
+                    type: 'scatter',
+                    mode: 'markers',
+                    name: '平多开空',
+                    marker: {{
+                        symbol: 'diamond',
+                        size: 14,
+                        color: '#ff9800',
+                        line: {{ color: '#fff', width: 1 }}
+                    }},
+                    text: fs.text,
+                    hoverinfo: 'text+x'
+                }});
+            }}
+            // 反手：平空开多
+            var fl = source.flip_long_markers || {{ x: [], y: [], text: [] }};
+            if (fl.x && fl.x.length > 0) {{
+                traces.push({{
+                    x: fl.x,
+                    y: fl.y,
+                    type: 'scatter',
+                    mode: 'markers',
+                    name: '平空开多',
+                    marker: {{
+                        symbol: 'star',
+                        size: 14,
+                        color: '#00bcd4',
+                        line: {{ color: '#fff', width: 1 }}
+                    }},
+                    text: fl.text,
+                    hoverinfo: 'text+x'
+                }});
+            }}
+
             var layout = {{
                 paper_bgcolor: 'rgba(0,0,0,0)',
                 plot_bgcolor: 'rgba(0,0,0,0)',
@@ -1725,29 +1764,82 @@ class HTMLReportGenerator:
             trades = result.get('trades', [])
             buy_markers = {'x': [], 'y': [], 'text': []}
             sell_markers = {'x': [], 'y': [], 'text': []}
-            
-            for trade in trades:
+            flip_short_markers = {'x': [], 'y': [], 'text': []}   # 平多开空（含单笔或 平多+开空 两腿）
+            flip_long_markers = {'x': [], 'y': [], 'text': []}   # 平空开多
+
+            def _fmt_trade_x(dt_raw):
+                """与 K 线/TICK 横轴类别字符串一致，便于 Plotly 对齐。"""
+                if is_tick:
+                    try:
+                        if hasattr(dt_raw, 'strftime'):
+                            dt = dt_raw
+                        else:
+                            dt = pd.to_datetime(dt_raw)
+                        return dt.strftime('%Y-%m-%d %H:%M:%S.') + f'{dt.microsecond // 1000:03d}'
+                    except Exception:
+                        return str(dt_raw)[:23]
+                return str(dt_raw)[:16]
+
+            # reverse_pos(next_bar_*) 会拆成「平多+开空」「平空+开多」两条记录，此处合并为反手标记
+            n_tr = len(trades)
+            paired_leg_indices = set()
+            if n_tr > 0:
+                order_by_time = sorted(
+                    range(n_tr),
+                    key=lambda i: (pd.to_datetime(trades[i].get('datetime'), errors='coerce'), i),
+                )
+                k = 0
+                while k < len(order_by_time) - 1:
+                    ia = order_by_time[k]
+                    ib = order_by_time[k + 1]
+                    ta, tb = trades[ia], trades[ib]
+                    a1 = str(ta.get('action', '') or '').strip()
+                    a2 = str(tb.get('action', '') or '').strip()
+                    x1 = _fmt_trade_x(ta.get('datetime'))
+                    x2 = _fmt_trade_x(tb.get('datetime'))
+                    if x1 != x2:
+                        k += 1
+                        continue
+                    p1 = float(ta.get('price', 0) or 0)
+                    p2 = float(tb.get('price', 0) or 0)
+                    px = (p1 + p2) / 2 if p1 and p2 else (p1 or p2)
+                    vol = int(ta.get('volume', 0) or 0) or int(tb.get('volume', 0) or 0) or 1
+                    if a1 == '平多' and a2 == '开空':
+                        paired_leg_indices.add(ia)
+                        paired_leg_indices.add(ib)
+                        flip_short_markers['x'].append(x1)
+                        flip_short_markers['y'].append(px)
+                        flip_short_markers['text'].append(f"平多开空 {vol}手 @ {px:.2f}")
+                        k += 2
+                        continue
+                    if a1 == '平空' and a2 == '开多':
+                        paired_leg_indices.add(ia)
+                        paired_leg_indices.add(ib)
+                        flip_long_markers['x'].append(x1)
+                        flip_long_markers['y'].append(px)
+                        flip_long_markers['text'].append(f"平空开多 {vol}手 @ {px:.2f}")
+                        k += 2
+                        continue
+                    k += 1
+
+            for i, trade in enumerate(trades):
+                if i in paired_leg_indices:
+                    continue
                 trade_time = trade.get('datetime', '')
                 price = trade.get('price', 0)
-                action = trade.get('action', '')
+                action = str(trade.get('action', '') or '').strip()
                 volume = trade.get('volume', 1)
-                
-                # 格式化时间 - TICK数据保留毫秒
-                if is_tick:
-                    # 尝试解析为datetime并格式化（保留毫秒）
-                    try:
-                        if hasattr(trade_time, 'strftime'):
-                            dt = trade_time
-                        else:
-                            dt = pd.to_datetime(trade_time)
-                        # 格式：2026-01-06 10:34:00.500
-                        trade_time = dt.strftime('%Y-%m-%d %H:%M:%S.') + f'{dt.microsecond // 1000:03d}'
-                    except:
-                        trade_time = str(trade_time)[:23]  # 保留到毫秒
-                else:
-                    trade_time = str(trade_time)[:16]  # K线只保留到分钟
-                
-                if action in ['开多', '平空']:
+                trade_time = _fmt_trade_x(trade_time)
+
+                if action == '平多开空':
+                    flip_short_markers['x'].append(trade_time)
+                    flip_short_markers['y'].append(float(price or 0))
+                    flip_short_markers['text'].append(f"{action} {volume}手 @ {float(price):.2f}")
+                elif action == '平空开多':
+                    flip_long_markers['x'].append(trade_time)
+                    flip_long_markers['y'].append(float(price or 0))
+                    flip_long_markers['text'].append(f"{action} {volume}手 @ {float(price):.2f}")
+                elif action in ['开多', '平空']:
                     buy_markers['x'].append(trade_time)
                     buy_markers['y'].append(price)
                     buy_markers['text'].append(f"{action} {volume}手 @ {price:.2f}")
@@ -1763,7 +1855,9 @@ class HTMLReportGenerator:
                 'key': key,
                 'ohlc': ohlc,
                 'buy_markers': buy_markers,
-                'sell_markers': sell_markers
+                'sell_markers': sell_markers,
+                'flip_short_markers': flip_short_markers,
+                'flip_long_markers': flip_long_markers,
             })
         
         return kline_sources
@@ -1938,6 +2032,8 @@ class HTMLReportGenerator:
                                 <option value="平多">平多</option>
                                 <option value="开空">开空</option>
                                 <option value="平空">平空</option>
+                                <option value="平多开空">平多开空</option>
+                                <option value="平空开多">平空开多</option>
                             </select>
                         </div>
                         <div class="filter-group">
@@ -2087,12 +2183,12 @@ class HTMLReportGenerator:
             commission = trade.get('commission', 0)
             net_profit = trade.get('net_profit', 0)
             
-            if action in ['开多', '平空']:
+            if action in ['开多', '平空', '平空开多']:
                 tag_class = 'buy'
             else:
                 tag_class = 'sell'
             
-            if action in ['平多', '平空']:
+            if action in ['平多', '平空', '平多开空', '平空开多']:
                 profit_class = 'profit' if net_profit > 0 else 'loss'
                 profit_str = f"{amount_profit:+,.2f}"
                 net_profit_str = f"{net_profit:+,.2f}"

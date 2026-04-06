@@ -161,6 +161,9 @@ if __name__ == "__main__":
             align_data=False,                 # 独立策略不需要对齐
             
             # -------- 多品种 data_sources：每条 symbol 独立；可 888 主连或 au2602、rb2505 等具体月 --------
+            # 每个品种可选设置资金分配（不填则所有品种平分 initial_capital）：
+            #   'capital_ratio': 6   — 按比例分配，如 A=6, B=4 则 A 占 60%, B 占 40%
+            #   'initial_capital': 60000  — 直接指定金额，如 A=60000, B=40000
             data_sources=[
                 {   # 数据源0: 黄金主力
                     'symbol': 'au888',          # 主连；可改 au2602
@@ -168,6 +171,8 @@ if __name__ == "__main__":
                     'adjust_type': '1',
                     'slippage_ticks': 1,
                     # price_tick, contract_multiplier 自动获取
+                    # 'capital_ratio': 1,       # 资金权重（不填则均分，如 A=6,B=4 即 A 占 60%）
+                    # 'initial_capital': 1,   # 或直接指定金额（如 60000）
                 },
                 {   # 数据源1: 螺纹钢主力
                     'symbol': 'rb888',          # 主连；可改 rb2505
@@ -175,6 +180,8 @@ if __name__ == "__main__":
                     'adjust_type': '1',
                     'slippage_ticks': 1,
                     # price_tick, contract_multiplier 自动获取
+                    # 'capital_ratio': 1,       # 资金权重（不填则均分，如 A=6,B=4 即 A 占 60%）
+                    # 'initial_capital': 1,   # 或直接指定金额（如 60000）
                 },
                 {   # 数据源2: 原油主力
                     'symbol': 'sc888',          # 主连；可改 sc2605
@@ -182,6 +189,8 @@ if __name__ == "__main__":
                     'adjust_type': '1',
                     'slippage_ticks': 1,
                     # price_tick, contract_multiplier 自动获取
+                    # 'capital_ratio': 1,       # 资金权重（不填则均分，如 A=6,B=4 即 A 占 60%）
+                    # 'initial_capital': 1,   # 或直接指定金额（如 60000）
                 },
             ],
             

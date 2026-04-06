@@ -292,7 +292,7 @@ if __name__ == "__main__":
         config = get_config(RUN_MODE,
             # -------- 基础配置 --------
             start_date='2025-12-01',          # 回测开始日期
-            end_date='2026-01-31',            # 回测结束日期
+            end_date='2026-4-31',            # 回测结束日期
             initial_capital=100000,           # 初始资金 (元)
             # commission=自动,                # 手续费率（自动从远程获取）
             # margin_rate=自动,               # 保证金率（自动从远程获取）
@@ -305,6 +305,9 @@ if __name__ == "__main__":
             lookback_bars=500,                # K线回溯窗口 (0=不限制，策略get_klines返回的最大条数)
             
             # -------- 多品种 data_sources --------
+            # 每个品种可选设置资金分配（不填则所有品种平分 initial_capital）：
+            #   'capital_ratio': 6   — 按比例分配，如 A=6, B=4 则 A 占 60%, B 占 40%
+            #   'initial_capital': 60000  — 直接指定金额，如 A=60000, B=40000
             data_sources=[
                 {   # 数据源0: 焦炭 1分钟
                     'symbol': 'j888',         # 主力合约（自动映射）
@@ -313,6 +316,7 @@ if __name__ == "__main__":
                     # 'price_tick': 自动,     # 最小变动价位（自动获取）
                     # 'contract_multiplier': 自动,  # 合约乘数（自动获取）
                     'slippage_ticks': 1,      # 滑点跳数
+                    'capital_ratio': 8,       # 资金权重: 4/10=40%
                 },
                 {   # 数据源1: 焦炭 5分钟
                     'symbol': 'j888',         # 同品种不同周期
@@ -321,6 +325,7 @@ if __name__ == "__main__":
                     # 'price_tick': 自动,     # 最小变动价位（自动获取）
                     # 'contract_multiplier': 自动,  # 合约乘数（自动获取）
                     'slippage_ticks': 1,      # 滑点跳数
+                    'capital_ratio': 1,       # 资金权重: 1/10=10%
                 },
                 {   # 数据源2: 焦煤 1分钟
                     'symbol': 'jm888',        # 主力合约（自动映射）
@@ -329,6 +334,7 @@ if __name__ == "__main__":
                     # 'price_tick': 自动,     # 最小变动价位（自动获取）
                     # 'contract_multiplier': 自动,  # 合约乘数（自动获取）
                     'slippage_ticks': 1,      # 滑点跳数
+                    'capital_ratio': 3,       # 资金权重: 3/10=30%
                 },
                 {   # 数据源3: 焦煤 5分钟
                     'symbol': 'jm888',        # 同品种不同周期
@@ -337,6 +343,7 @@ if __name__ == "__main__":
                     # 'price_tick': 自动,     # 最小变动价位（自动获取）
                     # 'contract_multiplier': 自动,  # 合约乘数（自动获取）
                     'slippage_ticks': 1,      # 滑点跳数
+                    'capital_ratio': 2,       # 资金权重: 2/10=20%
                 },
             ]
         )

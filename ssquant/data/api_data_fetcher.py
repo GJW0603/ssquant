@@ -1077,23 +1077,20 @@ def _try_data_server_api(symbol, start_date=None, end_date=None, kline_period='1
         DataFrame（成功）或 None（data_server 无数据或不可用）
     """
     try:
-        from ..config._server_config import DATA_SERVER
-        api_url = DATA_SERVER.get('api_url', '')
-        
-        if not api_url:
+        from .auth_manager import get_ordered_data_server_api_bases
+        api_bases = get_ordered_data_server_api_bases()
+        if not api_bases:
             return None
-        
-        url = f"{api_url.rstrip('/')}/api/futures/history"
-        
+
         normalized_period = kline_period.strip().upper()
-        
+
         # 直接请求目标周期（data_server 服务端完成 1M→目标周期 的聚合）
         params = {
             'symbol': symbol.lower(),
             'period': normalized_period,
             'adjust_type': '0',
         }
-        
+
         # 根据请求模式填充参数
         if start_time or end_time:
             if start_time:
@@ -1109,7 +1106,7 @@ def _try_data_server_api(symbol, start_date=None, end_date=None, kline_period='1
             desc = f"({start_date or '...'}~{end_date or '...'})"
         else:
             desc = ""
-        
+
         if limit:
             params['limit'] = limit
             desc = f"(limit={limit})" if not desc else f"{desc} limit={limit}"
@@ -1117,41 +1114,53 @@ def _try_data_server_api(symbol, start_date=None, end_date=None, kline_period='1
             params['limit'] = 5000
             desc = "(limit=5000 default)"
 
-        resp = requests.get(url, params=params, timeout=(20, 180))
-        if resp.status_code != 200:
-            return None
+        for api_base in api_bases:
+            url = f"{api_base}/api/futures/history"
+            try:
+                resp = requests.get(url, params=params, timeout=(20, 180))
+            except requests.exceptions.ConnectionError:
+                continue
+            except Exception:
+                continue
 
-        result = resp.json()
-        if result.get('code') != 0:
-            return None
+            if resp.status_code != 200:
+                continue
 
-        data_obj = result.get('data', {})
-        records = data_obj.get('klines', []) if isinstance(data_obj, dict) else data_obj
+            try:
+                result = resp.json()
+            except Exception:
+                continue
 
-        if not records:
-            return None
+            if result.get('code') != 0:
+                continue
 
-        df = pd.DataFrame(records)
-        
-        if df.empty or 'datetime' not in df.columns:
-            return None
-        
-        df['datetime'] = pd.to_datetime(df['datetime'])
-        df = df.set_index('datetime')
-        df = df[~df.index.duplicated(keep='last')]
-        
-        print(f"[data_server API] 获取 {normalized_period} 数据: {symbol} {desc} {len(df)} 条")
-        
-        # 本地复权（当前为占位直通，后续实现算法后自动生效）
-        if adjust_type != '0':
-            from .local_adjust import apply_local_adjust
-            df = apply_local_adjust(df, symbol, kline_period, adjust_type)
-        
-        return df
-        
-    except requests.exceptions.ConnectionError:
+            data_obj = result.get('data', {})
+            records = data_obj.get('klines', []) if isinstance(data_obj, dict) else data_obj
+
+            if not records:
+                continue
+
+            df = pd.DataFrame(records)
+
+            if df.empty or 'datetime' not in df.columns:
+                continue
+
+            df['datetime'] = pd.to_datetime(df['datetime'])
+            df = df.set_index('datetime')
+            df = df[~df.index.duplicated(keep='last')]
+
+            print(f"[data_server API] 获取 {normalized_period} 数据: {symbol} {desc} {len(df)} 条 (via {api_base})")
+
+            # 本地复权（当前为占位直通，后续实现算法后自动生效）
+            if adjust_type != '0':
+                from .local_adjust import apply_local_adjust
+                df = apply_local_adjust(df, symbol, kline_period, adjust_type)
+
+            return df
+
         return None
-    except Exception as e:
+
+    except Exception:
         return None
 
 

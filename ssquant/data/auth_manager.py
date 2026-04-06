@@ -53,16 +53,28 @@ def _build_verify_urls() -> List[str]:
     """主 api_url + fallback_servers[*].api_url，顺序与 WSKlineClient.ws_urls 一致。"""
     ds = _data_server_dict()
     urls = []
+    for base in get_ordered_data_server_api_bases():
+        urls.append(f"{base}/api/auth/verify")
+    return urls
+
+
+def get_ordered_data_server_api_bases() -> List[str]:
+    """主 api_url 与 fallback_servers[*].api_url 的 HTTP 基址（与鉴权、WS 端点顺序一致）。
+
+    data_server 的 REST（如 /api/futures/history）须与鉴权使用同一套地址；仅配置 fallback、未配顶层 api_url 时仍应能拉取数据。
+    """
+    ds = _data_server_dict()
+    out: List[str] = []
     api = ds.get('api_url')
     if api:
-        urls.append(f"{api.rstrip('/')}/api/auth/verify")
+        out.append(api.rstrip('/'))
     for fb in (ds.get('fallback_servers') or []):
         a = fb.get('api_url')
         if a:
-            urls.append(f"{a.rstrip('/')}/api/auth/verify")
-    if not urls:
-        urls.append('http://121.237.178.245:8086/api/auth/verify')
-    return urls
+            out.append(a.rstrip('/'))
+    if not out:
+        out.append('http://121.237.178.245:8086')
+    return out
 
 
 def _ordered_verify_indices(n: int) -> List[int]:

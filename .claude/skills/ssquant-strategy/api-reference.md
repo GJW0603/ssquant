@@ -1,6 +1,7 @@
 # StrategyAPI 完整方法参考
 
-> 来源: `ssquant/api/strategy_api.py`
+> 来源: `ssquant/api/strategy_api.py`  
+> **v0.4.4**：`get_account` / `get_balance` / `get_available` / `get_position_profit` / `get_close_profit` / `get_margin` / `get_commission` 在**回测、SIMNOW、实盘**均可用（文档注释已与行为对齐）。
 
 ## 构造
 

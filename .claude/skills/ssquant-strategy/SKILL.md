@@ -1,7 +1,7 @@
 ---
 name: ssquant-strategy
 description: 编写符合 SSQuant 框架规范的中国期货量化交易策略
-version: 0.4.3
+version: 0.4.4
 tags: [quant, futures, ctp, strategy, trading, python]
 author: SSQuant Team
 ---
@@ -174,3 +174,9 @@ def strategy(api: StrategyAPI):
 5. **不要在策略中 import 非标准库**，除非确认运行环境已安装
 6. **参数外置**：可调参数放在 PARAMS 字典或 config 的 params 中
 7. **data_server 模式下** `get_price()` 返回复权价，`get_raw_price()` 返回原始价
+
+## 版本与文档（v0.4.4）
+
+- 框架版本见 `ssquant.__init__.__version__`（当前 **0.4.4**）。
+- 发布说明、回测统计修复、多数据源 `capital_ratio`、data_server 备用 HTTP 等：**`更新日志_v0.4.4.md`**。
+- 多品种多周期示例：`examples/B_多品种多周期交易策略.py`（`data_sources` 内可配 `capital_ratio` / `initial_capital`）。

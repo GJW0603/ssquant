@@ -251,35 +251,64 @@ class UnifiedStrategyRunner:
         # 创建回测器
         self.backtester = MultiSourceBacktester()
 
-        # 回测账户初始资金：
-        # - 单数据源：使用顶层 initial_capital
-        # - 多数据源：汇总每个品种实际生效的 initial_capital，作为组合账户总初始资金
+        # 回测账户初始资金（支持两种分配模式）：
+        # 模式1 - 绝对金额：每个 DS 设置 initial_capital，按品种去重求和
+        # 模式2 - 比例权重：每个 DS 设置 capital_ratio，基于顶层 initial_capital 按权重分配
+        #   capital_ratio 按数据源独立分配（同品种不同周期可设不同权重）
+        top_level_capital = self.config.get('initial_capital', 100000)
+        _resolved_symbol_capitals = {}  # {symbol: 品种级 initial_capital，用于 symbol_config}
+        _per_ds_capitals = None         # 按 DS 顺序的资金列表，ratio 模式下有效
         total_initial_capital = 0
+
         if 'data_sources' in self.config:
-            symbol_initial_capitals = {}
-            for ds_config in self.config['data_sources']:
-                symbol = ds_config['symbol']
-                symbol_initial_capitals[symbol] = ds_config.get(
-                    'initial_capital',
-                    self.config.get('initial_capital', 100000)
-                )
-            total_initial_capital = sum(symbol_initial_capitals.values()) or self.config.get('initial_capital', 100000)
+            _has_ratio = any('capital_ratio' in ds for ds in self.config['data_sources'])
+
+            if _has_ratio:
+                # 比例模式：每个 DS 独立权重，未指定的默认 1.0
+                _ds_ratios = []
+                for ds_config in self.config['data_sources']:
+                    _ds_ratios.append(float(ds_config.get('capital_ratio', 1.0)))
+                total_ratio = sum(_ds_ratios)
+                _per_ds_capitals = [top_level_capital * r / total_ratio for r in _ds_ratios]
+                total_initial_capital = top_level_capital
+                # 按品种汇总（用于 symbol_config 的 initial_capital 字段）
+                for ds_config, ds_cap in zip(self.config['data_sources'], _per_ds_capitals):
+                    sym = ds_config['symbol']
+                    _resolved_symbol_capitals[sym] = _resolved_symbol_capitals.get(sym, 0) + ds_cap
+                # 打印分配结果
+                print(f"\n[资金分配] 总资金 {top_level_capital:,.0f} 元，按 capital_ratio 分配：")
+                for ds_config, ds_cap, ratio in zip(self.config['data_sources'], _per_ds_capitals, _ds_ratios):
+                    pct = ratio / total_ratio * 100
+                    print(f"  {ds_config['symbol']} {ds_config.get('kline_period',''):>4s}  "
+                          f"权重 {ratio:g}  →  {pct:5.1f}%  →  {ds_cap:>10,.0f} 元")
+                print()
+            else:
+                # 绝对金额模式（原有逻辑）
+                for ds_config in self.config['data_sources']:
+                    sym = ds_config['symbol']
+                    _resolved_symbol_capitals[sym] = ds_config.get(
+                        'initial_capital', top_level_capital
+                    )
+                total_initial_capital = sum(_resolved_symbol_capitals.values()) or top_level_capital
         else:
-            total_initial_capital = self.config.get('initial_capital', 100000)
+            total_initial_capital = top_level_capital
         
         # 设置基础配置
         lookback_bars = self.config.get('lookback_bars', 500)
-        self.backtester.set_base_config({
+        _base_cfg = {
             'username': API_USERNAME,
             'password': API_PASSWORD,
             'use_cache': self.config.get('use_cache', True),
             'save_data': self.config.get('save_data', True),
             'align_data': self.config.get('align_data', False),
             'fill_method': self.config.get('fill_method', 'ffill'),
-            'lookback_bars': lookback_bars,  # K线回溯窗口大小
+            'lookback_bars': lookback_bars,
             'debug': self.config.get('debug', False),
             'initial_capital': total_initial_capital,
-        })
+        }
+        if _per_ds_capitals is not None:
+            _base_cfg['_per_ds_capitals'] = _per_ds_capitals
+        self.backtester.set_base_config(_base_cfg)
         
         # 添加数据源配置（支持单数据源和多数据源）
         if 'data_sources' in self.config:
@@ -351,7 +380,7 @@ class UnifiedStrategyRunner:
                         'start_time': self.config.get('start_time'),
                         'end_time': self.config.get('end_time'),
                         'limit': self.config.get('limit'),
-                        'initial_capital': ds_config.get('initial_capital', self.config.get('initial_capital', 100000)),
+                        'initial_capital': _resolved_symbol_capitals.get(symbol, ds_config.get('initial_capital', top_level_capital)),
                         'commission': ds_config.get('commission',
                                                     auto_params.get('commission',
                                                     self.config.get('commission', 0.0001))),

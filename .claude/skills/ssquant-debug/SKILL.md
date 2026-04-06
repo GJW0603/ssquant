@@ -1,7 +1,7 @@
 ---
 name: ssquant-debug
 description: 诊断和排查 SSQuant 框架中的 CTP 连接、数据、策略和交易问题
-version: 0.4.3
+version: 0.4.4
 tags: [quant, futures, ctp, debugging, troubleshooting]
 author: SSQuant Team
 ---
@@ -11,6 +11,8 @@ author: SSQuant Team
 ## 你是什么
 
 你是一个专业的期货量化系统诊断助手，能够系统性地排查 SSQuant 框架在回测、仿真和实盘中遇到的各类问题。
+
+**框架 v0.4.4**：发布说明见 **`更新日志_v0.4.4.md`**。
 
 ## 诊断流程
 
@@ -71,6 +73,12 @@ print(f"CTP 可用: {CTP_AVAILABLE}")
 3. 检查 `kline_period` 格式（`1m/5m/15m/30m/1h/1d`）
 4. 检查网络 / API 认证（`API_USERNAME` / `API_PASSWORD`）
 5. 尝试 `use_cache=False` 排除缓存问题
+
+#### 症状: 鉴权通过但回测仍提示 data_server 无法获取数据（v0.4.4 前常见）
+
+**原因**：旧版历史 K 线请求可能未遍历 `fallback_servers`，与鉴权端点不一致。
+
+**处理**：升级到 **v0.4.4+**；并检查 `ssquant/config/_server_config.py`（或账户 `data_server`）中 **`api_url` 与 `fallback_servers` 是否指向可提供服务且库内有合约数据**的节点。
 
 #### 症状: 数据有缺失或跳跃
 

@@ -112,8 +112,21 @@ class BacktestResultCalculator:
         """
         results = {}
         
+        # 资金分配：统计每个品种的 initial_capital 和对应的数据源数量
+        num_data_sources = len(multi_data_source.data_sources)
+        _symbol_ds_info = {}
+        for ds in multi_data_source.data_sources:
+            sc = symbol_configs.get(ds.symbol, {})
+            cap = sc.get('initial_capital', 100000.0)
+            if ds.symbol not in _symbol_ds_info:
+                _symbol_ds_info[ds.symbol] = {'capital': cap, 'count': 0}
+            _symbol_ds_info[ds.symbol]['count'] += 1
+        # 判断分配模式：所有品种 initial_capital 相同 → 共享总资金均分；不同 → 按品种独立分配
+        _unique_capitals = set(v['capital'] for v in _symbol_ds_info.values())
+        _shared_capital_mode = len(_unique_capitals) == 1 and num_data_sources > 1
+        
         # 遍历所有数据源
-        for i, ds in enumerate(multi_data_source.data_sources):
+        for ds_idx, ds in enumerate(multi_data_source.data_sources):
             # 获取交易记录
             trades = ds.trades
             result_end_idx = int(getattr(ds, 'result_end_idx', len(ds.data)) or 0)
@@ -121,10 +134,10 @@ class BacktestResultCalculator:
             effective_data = ds.data.iloc[:result_end_idx].copy() if result_end_idx > 0 else ds.data.iloc[0:0].copy()
             
             if not trades:
-                self.log(f"数据源 #{i} ({ds.symbol} {ds.kline_period}) 没有交易记录")
+                self.log(f"数据源 #{ds_idx} ({ds.symbol} {ds.kline_period}) 没有交易记录")
                 continue
             if effective_data.empty:
-                self.log(f"数据源 #{i} ({ds.symbol} {ds.kline_period}) 没有可用于生成报告的回测区间")
+                self.log(f"数据源 #{ds_idx} ({ds.symbol} {ds.kline_period}) 没有可用于生成报告的回测区间")
                 continue
             
             # 获取品种配置
@@ -137,7 +150,17 @@ class BacktestResultCalculator:
             commission_rate = symbol_config.get('commission', 0.0003)
             margin_rate = symbol_config.get('margin_rate', 0.1)
             contract_multiplier = symbol_config.get('contract_multiplier', 10)
-            initial_capital = symbol_config.get('initial_capital', 100000.0)
+            _ds_allocated = getattr(ds, '_allocated_capital', None)
+            if _ds_allocated is not None:
+                initial_capital = _ds_allocated
+            else:
+                raw_capital = symbol_config.get('initial_capital', 100000.0)
+                if _shared_capital_mode:
+                    initial_capital = raw_capital / num_data_sources
+                elif num_data_sources > 1:
+                    initial_capital = raw_capital / _symbol_ds_info[ds.symbol]['count']
+                else:
+                    initial_capital = raw_capital
             
             # 获取固定金额手续费（元/手）
             commission_per_lot = symbol_config.get('commission_per_lot', 0)
@@ -149,111 +172,207 @@ class BacktestResultCalculator:
             # - 如果费率 ≈ 1e-06（无意义占位符）且固定金额 > 0，则使用固定金额（如黄金 10元/手）
             use_fixed_commission = commission_rate < 1e-05 and commission_per_lot > 0.1
             
-            # 计算交易统计
-            total_trades = len(trades) // 2  # 修改为开平仓一组算一次交易
-            
-            # 计算每笔交易的盈亏
-            for j, trade in enumerate(trades):
-                if j % 2 == 0 and j+1 < len(trades):  # 开仓交易
-                    open_price = trade['price']
-                    close_price = trades[j+1]['price']
-                    volume = trade['volume']
-                    
-                    # 计算点数盈亏
-                    if trade['action'] == '开多':
-                        points_profit = (close_price - open_price)
-                    elif trade['action'] == '开空':
-                        points_profit = (open_price - close_price)
+            # ===== 基于均价跟踪计算每笔交易的盈亏（支持加仓/部分平仓/复合反手） =====
+            _long_pos = 0
+            _long_avg_price = 0.0
+            _short_pos = 0
+            _short_avg_price = 0.0
+
+            def _calc_trade_commission(action, price, vol):
+                """根据动作类型（开仓/平仓）计算手续费"""
+                is_close = action in ('平多', '平空')
+                if use_fixed_commission:
+                    per_lot = commission_close_per_lot if is_close else commission_per_lot
+                    return per_lot * vol
+                return price * vol * contract_multiplier * commission_rate
+
+            for trade in trades:
+                action = trade['action']
+                price = trade['price']
+                volume = trade['volume']
+                _slippage_per_unit = trade.get('slippage_cost', 0)
+
+                if action == '开多':
+                    trade['slippage'] = _slippage_per_unit * volume * contract_multiplier
+                    comm = _calc_trade_commission(action, price, volume)
+                    trade['commission'] = comm
+                    trade['points_profit'] = 0
+                    trade['amount_profit'] = 0
+                    trade['margin'] = price * volume * contract_multiplier * margin_rate
+                    if _long_pos > 0:
+                        _long_avg_price = (_long_pos * _long_avg_price + volume * price) / (_long_pos + volume)
                     else:
-                        points_profit = 0
-                    
-                    # 计算金额盈亏（考虑合约乘数）
-                    amount_profit = points_profit * volume * contract_multiplier
-                    
-                    # 计算手续费（支持固定金额和费率两种方式）
-                    if use_fixed_commission:
-                        # 固定金额：元/手 × 手数
-                        open_commission = commission_per_lot * volume
-                        close_commission = commission_close_per_lot * volume
+                        _long_avg_price = price
+                    _long_pos += volume
+
+                elif action == '平多':
+                    actual_vol = min(volume, _long_pos)
+                    if actual_vol <= 0:
+                        trade['commission'] = 0
+                        trade['points_profit'] = 0
+                        trade['amount_profit'] = 0
+                        trade['net_profit'] = 0
+                        trade['roi'] = 0
+                        trade['profit'] = 0
+                        trade['slippage'] = 0
+                        trade['margin'] = 0
+                        continue
+                    trade['slippage'] = _slippage_per_unit * actual_vol * contract_multiplier
+                    comm = _calc_trade_commission(action, price, actual_vol)
+                    pts = price - _long_avg_price
+                    amt = pts * actual_vol * contract_multiplier
+                    net = amt - comm
+                    mgn = max(_long_avg_price, price) * actual_vol * contract_multiplier * margin_rate
+                    trade['commission'] = comm
+                    trade['points_profit'] = pts
+                    trade['amount_profit'] = amt
+                    trade['net_profit'] = net
+                    trade['roi'] = net / mgn * 100 if mgn > 0 else 0
+                    trade['profit'] = net
+                    trade['margin'] = mgn
+                    _long_pos -= actual_vol
+                    if _long_pos <= 0:
+                        _long_pos = 0
+                        _long_avg_price = 0.0
+
+                elif action == '开空':
+                    trade['slippage'] = _slippage_per_unit * volume * contract_multiplier
+                    comm = _calc_trade_commission(action, price, volume)
+                    trade['commission'] = comm
+                    trade['points_profit'] = 0
+                    trade['amount_profit'] = 0
+                    trade['margin'] = price * volume * contract_multiplier * margin_rate
+                    if _short_pos > 0:
+                        _short_avg_price = (_short_pos * _short_avg_price + volume * price) / (_short_pos + volume)
                     else:
-                        # 费率：成交金额 × 费率
-                        open_commission = open_price * volume * contract_multiplier * commission_rate
-                        close_commission = close_price * volume * contract_multiplier * commission_rate
-                    total_commission = open_commission + close_commission
-                    
-                    # 计算滑点成本（单位滑点 × 手数 × 合约乘数）
-                    open_slippage = trade.get('slippage_cost', 0) * volume * contract_multiplier
-                    close_slippage = trades[j+1].get('slippage_cost', 0) * volume * contract_multiplier
-                    total_slippage = open_slippage + close_slippage
-                    
-                    # 计算净盈亏（扣除手续费，滑点已在成交价格中体现）
-                    net_profit = amount_profit - total_commission
-                    
-                    # 计算保证金占用
-                    margin = max(open_price, close_price) * volume * contract_multiplier * margin_rate
-                    
-                    # 计算收益率
-                    roi = net_profit / margin * 100 if margin > 0 else 0
-                    
-                    # 添加盈亏字段
-                    trades[j]['points_profit'] = 0  # 开仓时点数盈亏为0
-                    trades[j]['amount_profit'] = 0  # 开仓时金额盈亏为0
-                    trades[j]['commission'] = open_commission  # 开仓手续费
-                    trades[j]['slippage'] = open_slippage  # 开仓滑点成本
-                    trades[j]['margin'] = margin  # 保证金占用
-                    
-                    trades[j+1]['points_profit'] = points_profit  # 平仓时记录点数盈亏
-                    trades[j+1]['amount_profit'] = amount_profit  # 平仓时记录金额盈亏
-                    trades[j+1]['commission'] = close_commission  # 平仓手续费
-                    trades[j+1]['slippage'] = close_slippage  # 平仓滑点成本
-                    trades[j+1]['net_profit'] = net_profit  # 净盈亏
-                    trades[j+1]['roi'] = roi  # 收益率
-                    trades[j+1]['profit'] = net_profit  # 兼容旧代码
-            
-            # 处理未配对的最后一笔开仓交易（如果有）
-            if len(trades) % 2 != 0:
-                last_trade = trades[-1]
-                if last_trade['action'] in ['开多', '开空']:
-                    # 计算开仓手续费
-                    last_price = last_trade['price']
-                    last_volume = last_trade['volume']
-                    if use_fixed_commission:
-                        last_commission = commission_per_lot * last_volume
-                    else:
-                        last_commission = last_price * last_volume * contract_multiplier * commission_rate
-                    # 设置手续费
-                    last_trade['commission'] = last_commission
-                    # 设置其他字段为默认值
-                    last_trade['points_profit'] = 0
-                    last_trade['amount_profit'] = 0
-                    last_trade['margin'] = last_price * last_volume * contract_multiplier * margin_rate
-            
-            # 重新计算统计数据
-            # 只统计平仓交易的盈亏情况
-            win_trades = sum(1 for t in trades if t.get('net_profit', 0) > 0 and t['action'] in ['平多', '平空'])
-            loss_trades = sum(1 for t in trades if t.get('net_profit', 0) < 0 and t['action'] in ['平多', '平空'])
+                        _short_avg_price = price
+                    _short_pos += volume
+
+                elif action == '平空':
+                    actual_vol = min(volume, _short_pos)
+                    if actual_vol <= 0:
+                        trade['commission'] = 0
+                        trade['points_profit'] = 0
+                        trade['amount_profit'] = 0
+                        trade['net_profit'] = 0
+                        trade['roi'] = 0
+                        trade['profit'] = 0
+                        trade['slippage'] = 0
+                        trade['margin'] = 0
+                        continue
+                    trade['slippage'] = _slippage_per_unit * actual_vol * contract_multiplier
+                    comm = _calc_trade_commission(action, price, actual_vol)
+                    pts = _short_avg_price - price
+                    amt = pts * actual_vol * contract_multiplier
+                    net = amt - comm
+                    mgn = max(_short_avg_price, price) * actual_vol * contract_multiplier * margin_rate
+                    trade['commission'] = comm
+                    trade['points_profit'] = pts
+                    trade['amount_profit'] = amt
+                    trade['net_profit'] = net
+                    trade['roi'] = net / mgn * 100 if mgn > 0 else 0
+                    trade['profit'] = net
+                    trade['margin'] = mgn
+                    _short_pos -= actual_vol
+                    if _short_pos <= 0:
+                        _short_pos = 0
+                        _short_avg_price = 0.0
+
+                elif action == '平多开空':
+                    close_vol = min(volume, _long_pos)
+                    open_vol = close_vol
+                    close_comm = 0
+                    pts = 0
+                    amt = 0
+                    if close_vol > 0:
+                        close_comm = _calc_trade_commission('平多', price, close_vol)
+                        pts = price - _long_avg_price
+                        amt = pts * close_vol * contract_multiplier
+                        _long_pos -= close_vol
+                        if _long_pos <= 0:
+                            _long_pos = 0
+                            _long_avg_price = 0.0
+                    open_comm = _calc_trade_commission('开空', price, open_vol) if open_vol > 0 else 0
+                    if open_vol > 0:
+                        if _short_pos > 0:
+                            _short_avg_price = (_short_pos * _short_avg_price + open_vol * price) / (_short_pos + open_vol)
+                        else:
+                            _short_avg_price = price
+                        _short_pos += open_vol
+                    total_comm = close_comm + open_comm
+                    net = amt - total_comm if close_vol > 0 else 0
+                    mgn = price * open_vol * contract_multiplier * margin_rate if open_vol > 0 else 0
+                    trade['slippage'] = trade.get('slippage_cost', 0) * (close_vol + open_vol) * contract_multiplier
+                    trade['commission'] = total_comm
+                    trade['points_profit'] = pts
+                    trade['amount_profit'] = amt
+                    trade['net_profit'] = net
+                    trade['roi'] = net / mgn * 100 if mgn > 0 and close_vol > 0 else 0
+                    trade['profit'] = net
+                    trade['margin'] = mgn
+
+                elif action == '平空开多':
+                    close_vol = min(volume, _short_pos)
+                    open_vol = close_vol
+                    close_comm = 0
+                    pts = 0
+                    amt = 0
+                    if close_vol > 0:
+                        close_comm = _calc_trade_commission('平空', price, close_vol)
+                        pts = _short_avg_price - price
+                        amt = pts * close_vol * contract_multiplier
+                        _short_pos -= close_vol
+                        if _short_pos <= 0:
+                            _short_pos = 0
+                            _short_avg_price = 0.0
+                    open_comm = _calc_trade_commission('开多', price, open_vol) if open_vol > 0 else 0
+                    if open_vol > 0:
+                        if _long_pos > 0:
+                            _long_avg_price = (_long_pos * _long_avg_price + open_vol * price) / (_long_pos + open_vol)
+                        else:
+                            _long_avg_price = price
+                        _long_pos += open_vol
+                    total_comm = close_comm + open_comm
+                    net = amt - total_comm if close_vol > 0 else 0
+                    mgn = price * open_vol * contract_multiplier * margin_rate if open_vol > 0 else 0
+                    trade['slippage'] = trade.get('slippage_cost', 0) * (close_vol + open_vol) * contract_multiplier
+                    trade['commission'] = total_comm
+                    trade['points_profit'] = pts
+                    trade['amount_profit'] = amt
+                    trade['net_profit'] = net
+                    trade['roi'] = net / mgn * 100 if mgn > 0 and close_vol > 0 else 0
+                    trade['profit'] = net
+                    trade['margin'] = mgn
+
+                else:
+                    trade.setdefault('commission', 0)
+                    trade.setdefault('points_profit', 0)
+                    trade.setdefault('amount_profit', 0)
+                    trade.setdefault('slippage', 0)
+                    trade.setdefault('margin', 0)
+
+            # ===== 统计交易数据（包含复合反手动作） =====
+            _close_actions = ('平多', '平空', '平多开空', '平空开多')
+            total_trades = sum(1 for t in trades if t['action'] in _close_actions)
+            win_trades = sum(1 for t in trades if t.get('net_profit', 0) > 0 and t['action'] in _close_actions)
+            loss_trades = sum(1 for t in trades if t.get('net_profit', 0) < 0 and t['action'] in _close_actions)
             win_rate = win_trades / (win_trades + loss_trades) if (win_trades + loss_trades) > 0 else 0
             
-            # 计算总盈亏
             total_points_profit = sum(t.get('points_profit', 0) for t in trades)
             total_amount_profit = sum(t.get('amount_profit', 0) for t in trades)
             total_commission = sum(t.get('commission', 0) for t in trades)
-            total_slippage = sum(t.get('slippage', 0) for t in trades)  # 总滑点成本
+            total_slippage = sum(t.get('slippage', 0) for t in trades)
             total_net_profit = sum(t.get('net_profit', 0) for t in trades)
             
-            # 计算平均盈亏
-            avg_win = sum(t.get('net_profit', 0) for t in trades if t.get('net_profit', 0) > 0) / win_trades if win_trades > 0 else 0
-            avg_loss = sum(t.get('net_profit', 0) for t in trades if t.get('net_profit', 0) < 0) / loss_trades if loss_trades > 0 else 0
+            _total_win_pnl = sum(t.get('net_profit', 0) for t in trades if t.get('net_profit', 0) > 0 and t['action'] in _close_actions)
+            _total_loss_pnl = abs(sum(t.get('net_profit', 0) for t in trades if t.get('net_profit', 0) < 0 and t['action'] in _close_actions))
+            avg_win = _total_win_pnl / win_trades if win_trades > 0 else 0
+            avg_loss = -(_total_loss_pnl / loss_trades) if loss_trades > 0 else 0
             
-            # 修正盈亏比计算方式
-            if avg_loss != 0:
-                # 使用绝对值计算盈亏比，确保结果为正数
-                profit_factor = abs(avg_win / avg_loss)
-                # 如果总体亏损，盈亏比应小于1
-                if total_net_profit < 0 and profit_factor > 1:
-                    profit_factor = 1 / profit_factor
+            if _total_loss_pnl > 0:
+                profit_factor = _total_win_pnl / _total_loss_pnl
             else:
-                profit_factor = float('inf') if avg_win > 0 else 0
+                profit_factor = float('inf') if _total_win_pnl > 0 else 0
             
             # 修改权益曲线计算方法，考虑持仓盈亏
             equity_curve = pd.Series(float(initial_capital), index=effective_data.index, dtype=float)  # 净利润曲线（扣除所有成本）
@@ -405,6 +524,68 @@ class BacktestResultCalculator:
                         if short_pos <= 0:
                             short_pos = 0
                             short_avg_price = 0
+
+                    elif trade['action'] == '平多开空':
+                        volume = trade['volume']
+                        price = trade['price']
+                        commission = trade.get('commission', 0)
+                        slippage_cost = trade.get('slippage', 0)
+                        cumulative_commission += commission
+                        cumulative_slippage += slippage_cost
+                        close_vol = min(volume, long_pos)
+                        open_vol = close_vol
+                        if close_vol > 0:
+                            position_value = long_avg_price * close_vol * contract_multiplier
+                            margin_released = position_value * margin_rate
+                            close_profit = (price - long_avg_price) * close_vol * contract_multiplier
+                            available_cash += (margin_released + close_profit)
+                            total_margin -= margin_released
+                            long_pos -= close_vol
+                            if long_pos <= 0:
+                                long_pos = 0
+                                long_avg_price = 0
+                        available_cash -= commission
+                        if open_vol > 0:
+                            position_cost = price * open_vol * contract_multiplier
+                            margin_required = position_cost * margin_rate
+                            available_cash -= margin_required
+                            total_margin += margin_required
+                            if short_pos > 0:
+                                short_avg_price = (short_pos * short_avg_price + open_vol * price) / (short_pos + open_vol)
+                            else:
+                                short_avg_price = price
+                            short_pos += open_vol
+
+                    elif trade['action'] == '平空开多':
+                        volume = trade['volume']
+                        price = trade['price']
+                        commission = trade.get('commission', 0)
+                        slippage_cost = trade.get('slippage', 0)
+                        cumulative_commission += commission
+                        cumulative_slippage += slippage_cost
+                        close_vol = min(volume, short_pos)
+                        open_vol = close_vol
+                        if close_vol > 0:
+                            position_value = short_avg_price * close_vol * contract_multiplier
+                            margin_released = position_value * margin_rate
+                            close_profit = (short_avg_price - price) * close_vol * contract_multiplier
+                            available_cash += (margin_released + close_profit)
+                            total_margin -= margin_released
+                            short_pos -= close_vol
+                            if short_pos <= 0:
+                                short_pos = 0
+                                short_avg_price = 0
+                        available_cash -= commission
+                        if open_vol > 0:
+                            position_cost = price * open_vol * contract_multiplier
+                            margin_required = position_cost * margin_rate
+                            available_cash -= margin_required
+                            total_margin += margin_required
+                            if long_pos > 0:
+                                long_avg_price = (long_pos * long_avg_price + open_vol * price) / (long_pos + open_vol)
+                            else:
+                                long_avg_price = price
+                            long_pos += open_vol
                     
                     # 标记交易为待移除，而不是直接移除
                     trades_to_remove.append(trade)
@@ -539,7 +720,7 @@ class BacktestResultCalculator:
             results[key] = ds_results
             
             # 打印结果摘要
-            self.log(f"\n数据源 #{i} ({ds.symbol} {ds.kline_period}) 回测结果:")
+            self.log(f"\n数据源 #{ds_idx} ({ds.symbol} {ds.kline_period}) 回测结果:")
             self.log(f"总交易次数: {total_trades}")
             self.log(f"盈利交易: {win_trades}, 亏损交易: {loss_trades}")
             self.log(f"胜率: {win_rate:.2%}")
@@ -573,7 +754,7 @@ class BacktestResultCalculator:
                 reason = trade.get('reason', '')
                 
                 # 只打印平仓交易的盈亏
-                if action in ['平多', '平空']:
+                if action in ['平多', '平空', '平多开空', '平空开多']:
                     profit_info = f" 点数盈亏:{points_profit:.2f} 金额盈亏:{amount_profit:.2f} 手续费:{commission:.2f} 净盈亏:{net_profit:.2f} ROI:{roi:.2f}%"
                 else:
                     profit_info = f" 手续费:{commission:.2f}"
@@ -600,6 +781,8 @@ class BacktestResultCalculator:
         
         summary_data = []
         for key, result in results.items():
+            if not isinstance(result, dict) or 'symbol' not in result:
+                continue
             summary_data.append({
                 '数据集': key,
                 '品种': result['symbol'],

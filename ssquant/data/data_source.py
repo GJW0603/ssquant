@@ -245,7 +245,10 @@ class DataSource:
             self.account_info['_last_order_rejected_for_funds'] = True
             self.account_info['_fund_reject_count'] = int(self.account_info.get('_fund_reject_count', 0) or 0) + 1
             if message:
-                self.account_info['_last_fund_reject_reason'] = message
+                dt = self.get_current_datetime()
+                dt_str = str(dt)[:19] if dt is not None else ""
+                tagged = f"[{dt_str}] {message}" if dt_str else message
+                self.account_info['_last_fund_reject_reason'] = tagged
         
     def set_data(self, data: pd.DataFrame):
         """设置数据"""

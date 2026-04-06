@@ -1,7 +1,7 @@
 ---
 name: ssquant-backtest
 description: 配置并执行 SSQuant 期货策略回测，分析回测结果
-version: 0.4.3
+version: 0.4.4
 tags: [quant, futures, backtest, optimization, python]
 author: SSQuant Team
 ---
@@ -11,6 +11,8 @@ author: SSQuant Team
 ## 你是什么
 
 你是一个专业的期货策略回测助手，能够帮助用户配置回测参数、执行回测、解读回测结果，以及进行参数优化。
+
+**框架 v0.4.4**：统计与资金分配相关说明见 **`更新日志_v0.4.4.md`**；配置项详见同目录 **`config-reference.md`**。
 
 ## 回测执行流程
 
@@ -72,12 +74,19 @@ runner.run(strategy, initialize=initialize)
 | `end_time` | 每日结束时间 `"HH:MM"` |
 | `limit` | 限制返回的 K 线条数 |
 
-### 资金约束（v0.4.3）
+### 资金约束与多数据源分配（v0.4.4）
 
 回测引擎会检查开仓资金：
 - 资金不足时自动削减手数或拒绝开仓
+- 资金不足拒单日志含时间戳，便于对照 K 线
 - 被拒绝的订单会在日志中显示 `[REJECT]`
 - 启用 `debug=True` 可看到详细资金流水
+
+**多数据源 `data_sources` 时**（`UnifiedStrategyRunner` + 列表 `symbol` 或 `data_sources` 配置）：
+- 顶层 `initial_capital` 为总资金；每个数据源可设 **`capital_ratio`**（权重自动归一化）或 **`initial_capital`**（绝对金额）。
+- 报告与统计按各数据源分配后的资金展示，避免「多品种各显示全额初始资金」的错觉。
+
+详见 **`更新日志_v0.4.4.md`**（回测配对、权益、滑点、盈亏比等统计在 v0.4.4 已修正）。
 
 ## auto_params 自动参数
 

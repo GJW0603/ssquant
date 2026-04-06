@@ -8,6 +8,7 @@
 [![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
 [![License](https://img.shields.io/badge/license-Non--Commercial-red.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux-lightgrey.svg)]()
+[![当前版本](https://img.shields.io/badge/当前版本-0.4.4-brightgreen.svg)](更新日志_v0.4.4.md)
 
 [GitHub](https://github.com/songshuquant/ssquant) | [Gitee（国内推荐）](https://gitee.com/ssquant/ssquant)
 
@@ -728,6 +729,20 @@ export LD_LIBRARY_PATH=/path/to/ssquant/ctp/py3xx:$LD_LIBRARY_PATH
 ---
 
 ## 📝 更新日志
+
+### v0.4.4 (2026-04-06) 📊 回测统计 · 多品种资金 · 数据服务一致性
+
+本版重点让**复杂成交场景下的回测数字更可信**，并理顺**多品种资金展示**与**远程历史 K 线**行为；升级后若策略含加仓、反手或多数据源，建议重新跑一遍回测对照。
+
+| 方向 | 说明 |
+|------|------|
+| **回测结果** | 加仓、减仓、反手等成交的配对与盈亏、权益曲线、滑点、盈亏比等统计已按实盘逻辑修正 |
+| **多品种资金** | 支持 `capital_ratio` 按比例划分总资金；报告里各数据源初始资金与总资金一致，不再「虚高」 |
+| **HTML 报告** | 可筛选反手类成交；K 线图上反手标记更清晰（含拆分成交合并显示） |
+| **data_server** | 历史 K 线 HTTP 请求与鉴权一致，按 `api_url` + `fallback_servers` 顺序尝试节点 |
+| **示例与文档** | 海龟示例逻辑修正；新增加仓/减仓/正反手等验证示例；账户类 API 文档与回测/仿真/实盘行为对齐 |
+
+详细说明见 [更新日志_v0.4.4.md](更新日志_v0.4.4.md)。
 
 ### v0.4.3 (2026-04-02) 🚀 自动移仓 & 实盘抗压 & 回测资金约束
 

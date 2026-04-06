@@ -126,10 +126,11 @@ def ma_cross_strategy(api: StrategyAPI):
 
     #api.log(f"current_price: {current_price}, current_datetime: {current_datetime}")
 
-    print("current_idx:",current_idx)
+    #print("current_idx:",current_idx)
 
     klines = api.get_klines()
     # 调试时打开 verbose_kline：打印最后一根 K（默认关闭，避免刷屏）
+    """
     if api.get_param('verbose_kline', False):
         _last_bar = klines.iloc[-1]
         print("klines (最后一根):")
@@ -151,7 +152,7 @@ def ma_cross_strategy(api: StrategyAPI):
         )
         print(_row.to_string(float_format=lambda x: f"{x:,.2f}"))
         print(f"K线窗口长度: {len(klines)}")
-    
+    """
     if current_idx < slow_ma:
         return
     
@@ -221,8 +222,8 @@ if __name__ == "__main__":
             adjust_type='1',                  # 复权: '0'不复权  '1'后复权  '2'前复权
             
             # -------- 数据范围（三选一，可组合）--------
-            start_date='2026-2-20',           # 开始日期
-            end_date='2026-03-29',            # 结束日期
+            start_date='2026-3-20',           # 开始日期
+            end_date='2026-4-29',            # 结束日期
             # start_time='2023-01-01 09:00:00',  # 或用精确时间
             # end_time='2026-03-26 23:05:00',
             # limit=50000,                       # 或取最近N根K线

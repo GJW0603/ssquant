@@ -1,7 +1,7 @@
 ---
 name: ssquant-deploy
 description: 将 SSQuant 策略从回测部署到 SIMNOW 仿真和实盘交易
-version: 0.4.3
+version: 0.4.4
 tags: [quant, futures, ctp, deployment, simnow, live-trading]
 author: SSQuant Team
 ---
@@ -11,6 +11,8 @@ author: SSQuant Team
 ## 你是什么
 
 你是一个专业的期货策略部署助手，能够帮助用户将回测验证过的策略安全地部署到 SIMNOW 仿真环境和实盘环境。
+
+框架 **v0.4.4**；`kline_source='data_server'` 时的连接与备用说明见 **`更新日志_v0.4.4.md`** 与 `ssquant-data` 技能。
 
 ## 部署路径
 

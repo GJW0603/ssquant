@@ -173,7 +173,7 @@ if __name__ == "__main__":
     from ssquant.config.trading_config import get_config
     
     # ========== 选择运行模式 ==========
-    RUN_MODE = RunMode.SIMNOW
+    RUN_MODE = RunMode.BACKTEST
     
     # ========== 策略参数 ==========
     strategy_params = {
@@ -200,6 +200,9 @@ if __name__ == "__main__":
             lookback_bars=500,                # K线回溯窗口 (0=不限制，策略get_klines返回的最大条数)
             
             # -------- 同品种两周期 data_sources --------
+            # 每个品种可选设置资金分配（不填则所有品种平分 initial_capital）：
+            #   'capital_ratio': 6   — 按比例分配，如 A=6, B=4 则 A 占 60%, B 占 40%
+            #   'initial_capital': 60000  — 直接指定金额，如 A=60000, B=40000
             data_sources=[
                 {   # 数据源0: 短周期 (入场信号)
                     'symbol': 'cu888',        # 品种+888 = 主力连续合约（回测时用于拉取连续K线）
@@ -208,6 +211,8 @@ if __name__ == "__main__":
                     # 'price_tick': 自动,     # 最小变动价位（自动获取）
                     # 'contract_multiplier': 自动,  # 合约乘数（自动获取）
                     'slippage_ticks': 1,      # 滑点跳数
+                    # 'capital_ratio': 1,     # 资金权重（不填则均分，如 A=6,B=4 即 A 占 60%）
+                    # 'initial_capital': 1,   # 或直接指定金额（如 60000）
                 },
                 {   # 数据源1: 长周期 (趋势过滤)
                     'symbol': 'cu888',        # 与短周期同品种
@@ -216,6 +221,8 @@ if __name__ == "__main__":
                     # 'price_tick': 自动,     # 最小变动价位（自动获取）
                     # 'contract_multiplier': 自动,  # 合约乘数（自动获取）
                     'slippage_ticks': 1,      # 滑点跳数
+                    # 'capital_ratio': 1,     # 资金权重（不填则均分，如 A=6,B=4 即 A 占 60%）
+                    # 'initial_capital': 1,   # 或直接指定金额（如 60000）
                 },
             ]
         )

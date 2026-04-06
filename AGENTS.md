@@ -2,7 +2,9 @@
 
 ## 项目概述
 
-SSQuant 是一个专业的 **中国期货 CTP 量化交易框架**（v0.4.3），基于 Python 构建，涵盖回测、仿真（SIMNOW）和实盘全链路。
+SSQuant 是一个专业的 **中国期货 CTP 量化交易框架**（**v0.4.4**），基于 Python 构建，涵盖回测、仿真（SIMNOW）和实盘全链路。
+
+**v0.4.4 要点**：回测侧交易配对/权益/滑点/盈亏比等统计修复；多数据源支持 `capital_ratio` 比例分配资金；data_server 历史 K 线 HTTP 与 `fallback_servers` 与鉴权一致轮询；详见仓库根目录 **`更新日志_v0.4.4.md`**。
 
 ## 技术栈
 
@@ -32,7 +34,7 @@ ssquant/
 ├── pyctp/            # CTP 客户端（SIMNOW / 实盘）
 │   ├── simnow_client.py
 │   └── real_trading_client.py
-└── __init__.py       # __version__ = "0.4.3"
+└── __init__.py       # __version__ = "0.4.4"
 examples/             # 25+ 示例策略（B_回测 / A_工具 / C_高级 / D_数据）
 ```
 
@@ -74,7 +76,7 @@ config = get_config(RunMode.BACKTEST, symbol="rb888", ...)
 2. **连续合约**: `888`（主力连续）、`777`（次主力）、`000`（指数合约）
 3. **复权类型**: `adjust_type='0'`(不复权) / `'1'`(后复权) / `'2'`(前复权)
 4. **移仓模式**: `simultaneous`（同时平旧开新）/ `sequential`（先平后开）
-5. **data_server 模式**: 服务器推送任意周期 K 线 + 订单流，无需本地聚合
+5. **data_server 模式**: 服务器推送任意周期 K 线 + 订单流，无需本地聚合；HTTP 鉴权与历史 K 线请求均遵循 `api_url` + `fallback_servers` 顺序（v0.4.4+）
 6. **不再支持 PyPI**，仅通过 Git 仓库安装更新
 
 ## AI Agent 技能
@@ -87,4 +89,6 @@ config = get_config(RunMode.BACKTEST, symbol="rb888", ...)
 | 回测验证 | `ssquant-backtest` | 配置并执行回测、分析结果 |
 | 部署上线 | `ssquant-deploy` | SIMNOW 仿真 → 实盘部署 |
 | 问题诊断 | `ssquant-debug` | 排查 CTP、数据、策略异常 |
-| 数据查询 | `ssquant-data` | 查询行情、持仓、账户数据 |
+| 数据查询 | `ssquant-data` | 查询行情、持仓、账户数据；含 data_server 与备用节点 |
+
+各技能包 frontmatter 中 `version` 与框架 **v0.4.4** 对齐；发布说明见 **`更新日志_v0.4.4.md`**。

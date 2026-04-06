@@ -653,7 +653,7 @@ class StrategyAPI:
     
     def get_account(self) -> dict:
         """
-        获取完整账户信息（仅实盘/SIMNOW模式有效）
+        获取完整账户信息（回测/SIMNOW/实盘 均有效）
         
         Returns:
             账户信息字典，包含以下字段：
@@ -685,7 +685,7 @@ class StrategyAPI:
     
     def get_balance(self) -> float:
         """
-        获取账户权益（仅实盘/SIMNOW模式有效）
+        获取账户权益（回测/SIMNOW/实盘 均有效）
         
         Returns:
             账户权益金额
@@ -696,7 +696,7 @@ class StrategyAPI:
     
     def get_available(self) -> float:
         """
-        获取可用资金（仅实盘/SIMNOW模式有效）
+        获取可用资金（回测/SIMNOW/实盘 均有效）
         
         Returns:
             可用资金金额
@@ -707,7 +707,7 @@ class StrategyAPI:
     
     def get_position_profit(self) -> float:
         """
-        获取持仓盈亏（仅实盘/SIMNOW模式有效）
+        获取持仓盈亏（回测/SIMNOW/实盘 均有效）
         
         Returns:
             持仓浮动盈亏
@@ -718,7 +718,7 @@ class StrategyAPI:
     
     def get_close_profit(self) -> float:
         """
-        获取平仓盈亏（仅实盘/SIMNOW模式有效）
+        获取平仓盈亏（回测/SIMNOW/实盘 均有效）
         
         Returns:
             当日平仓盈亏
@@ -729,7 +729,7 @@ class StrategyAPI:
     
     def get_margin(self) -> float:
         """
-        获取占用保证金（仅实盘/SIMNOW模式有效）
+        获取占用保证金（回测/SIMNOW/实盘 均有效）
         
         Returns:
             当前占用保证金
@@ -740,7 +740,7 @@ class StrategyAPI:
     
     def get_commission(self) -> float:
         """
-        获取手续费（仅实盘/SIMNOW模式有效）
+        获取手续费（回测/SIMNOW/实盘 均有效）
         
         Returns:
             当日手续费

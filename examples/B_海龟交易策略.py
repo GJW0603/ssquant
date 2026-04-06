@@ -33,6 +33,8 @@ from ssquant.backtest.unified_runner import UnifiedStrategyRunner, RunMode
 import pandas as pd
 import numpy as np
 
+_turtle_state = {}  # {data_source_index: {'last_entry_price': float}}
+
 def initialize(api:StrategyAPI):
     """
     策略初始化函数
@@ -197,9 +199,11 @@ def turtle_trading_strategy(api: StrategyAPI):
         current_exit_upper = exit_upper.iloc[-1]
         current_exit_lower = exit_lower.iloc[-1]
         
-        # 获取前一天的通道值和价格（用于判断突破）
+        # 使用前一根K线的通道值判断突破（当前K线包含在通道中，用当前值会导致突破条件无法触发）
         prev_entry_upper = entry_upper.iloc[-2]
         prev_entry_lower = entry_lower.iloc[-2]
+        prev_exit_upper = exit_upper.iloc[-2]
+        prev_exit_lower = exit_lower.iloc[-2]
         prev_close = close.iloc[-2]
         
         # 计算ATR
@@ -223,8 +227,9 @@ def turtle_trading_strategy(api: StrategyAPI):
         symbol_configs = api.get_param('symbol_configs', {})
         symbol_config = symbol_configs.get(symbol, {})
         
-        # 从配置中读取初始资金和合约乘数
-        account_size = symbol_config.get('initial_capital', 100000.0)
+        # 使用实时账户权益计算头寸（盈利时放大、亏损时缩小）
+        # 回退到初始资金（首次调用或权益异常时）
+        account_size = api.get_balance() or symbol_config.get('initial_capital', 100000.0)
         contract_multiplier = symbol_config.get('contract_multiplier', 10)
         
         # 获取当前持仓
@@ -250,56 +255,65 @@ def turtle_trading_strategy(api: StrategyAPI):
             api.log(f"单个系统单位规模: {unit_size}, 当前单位数: {current_units:.2f}/{max_units}")
             api.log(f"保证金/手: {margin_per_lot:.0f}, 最大可开: {max_total_lots}, 当前持仓: {current_pos}")
         
+        # 获取/初始化该数据源的状态
+        state = _turtle_state.setdefault(i, {'last_entry_price': 0.0})
+
         # 交易逻辑
         # 情况1: 当前无持仓
         if current_pos == 0:
+            state['last_entry_price'] = 0.0
+
             # 检查是否突破入场通道上轨（做多信号）
             if current_price > prev_entry_upper:
                 if unit_size > 0:
                     api.log(f"品种 {symbol} 价格 {current_price:.2f} 突破入场通道上轨 {prev_entry_upper:.2f}，开多仓 1个单位 ({unit_size})")
                     api.buy(volume=int(unit_size), order_type='next_bar_open', index=i)
+                    state['last_entry_price'] = current_price
                 else:
                     api.log(f"品种 {symbol} 多头信号触发，但保证金不足，跳过开仓")
-                
+
             # 检查是否突破入场通道下轨（做空信号）
             elif current_price < prev_entry_lower:
                 if unit_size > 0:
                     api.log(f"品种 {symbol} 价格 {current_price:.2f} 突破入场通道下轨 {prev_entry_lower:.2f}，开空仓 1个单位 ({unit_size})")
                     api.sellshort(volume=int(unit_size), order_type='next_bar_open', index=i)
+                    state['last_entry_price'] = current_price
                 else:
                     api.log(f"品种 {symbol} 空头信号触发，但保证金不足，跳过开仓")
-        
+
         # 情况2: 当前持有多仓
         elif current_pos > 0:
-            # 检查是否突破出场通道下轨（平多信号）
-            if current_price < current_exit_lower:
-                api.log(f"品种 {symbol} 价格 {current_price:.2f} 突破出场通道下轨 {current_exit_lower:.2f}，平多仓")
+            # 检查是否跌破出场通道下轨（平多信号） —— 使用前一根K线的通道值
+            if current_price < prev_exit_lower:
+                api.log(f"品种 {symbol} 价格 {current_price:.2f} 跌破出场通道下轨 {prev_exit_lower:.2f}，平多仓")
                 api.sell(order_type='next_bar_open', index=i)
-            
-            # 检查是否可以加仓（价格上涨0.5个ATR且未达到最大单位数）
-            elif current_units < max_units and unit_size > 0:
-                last_entry_price = current_price - current_atr
-                if current_price >= last_entry_price + 0.5 * current_atr:
+                state['last_entry_price'] = 0.0
+
+            # 检查是否可以加仓（价格相对最后入场价上涨0.5个ATR且未达到最大单位数）
+            elif current_units < max_units and unit_size > 0 and state['last_entry_price'] > 0:
+                if current_price >= state['last_entry_price'] + 0.5 * current_atr:
                     new_unit_size = int(unit_size)
                     if new_unit_size > 0:
-                        api.log(f"品种 {symbol} 价格上涨0.5个ATR，加多仓 1个单位 ({new_unit_size})")
+                        api.log(f"品种 {symbol} 价格 {current_price:.2f} 较上次入场 {state['last_entry_price']:.2f} 上涨0.5ATR，加多仓 ({new_unit_size})")
                         api.buy(volume=new_unit_size, order_type='next_bar_open', index=i)
-        
+                        state['last_entry_price'] = current_price
+
         # 情况3: 当前持有空仓
         elif current_pos < 0:
-            # 检查是否突破出场通道上轨（平空信号）
-            if current_price > current_exit_upper:
-                api.log(f"品种 {symbol} 价格 {current_price:.2f} 突破出场通道上轨 {current_exit_upper:.2f}，平空仓")
+            # 检查是否突破出场通道上轨（平空信号） —— 使用前一根K线的通道值
+            if current_price > prev_exit_upper:
+                api.log(f"品种 {symbol} 价格 {current_price:.2f} 突破出场通道上轨 {prev_exit_upper:.2f}，平空仓")
                 api.buycover(order_type='next_bar_open', index=i)
-            
-            # 检查是否可以加仓（价格下跌0.5个ATR且未达到最大单位数）
-            elif current_units < max_units and unit_size > 0:
-                last_entry_price = current_price + current_atr
-                if current_price <= last_entry_price - 0.5 * current_atr:
+                state['last_entry_price'] = 0.0
+
+            # 检查是否可以加仓（价格相对最后入场价下跌0.5个ATR且未达到最大单位数）
+            elif current_units < max_units and unit_size > 0 and state['last_entry_price'] > 0:
+                if current_price <= state['last_entry_price'] - 0.5 * current_atr:
                     new_unit_size = int(unit_size)
                     if new_unit_size > 0:
-                        api.log(f"品种 {symbol} 价格下跌0.5个ATR，加空仓 1个单位 ({new_unit_size})")
+                        api.log(f"品种 {symbol} 价格 {current_price:.2f} 较上次入场 {state['last_entry_price']:.2f} 下跌0.5ATR，加空仓 ({new_unit_size})")
                         api.sellshort(volume=new_unit_size, order_type='next_bar_open', index=i)
+                        state['last_entry_price'] = current_price
 
 if __name__ == "__main__":
     from ssquant.config.trading_config import get_config

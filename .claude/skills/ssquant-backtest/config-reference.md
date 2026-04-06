@@ -1,6 +1,7 @@
 # TradingConfig 完整配置参考
 
-> 来源: `ssquant/config/trading_config.py`
+> 来源: `ssquant/config/trading_config.py`  
+> 框架版本 **v0.4.4**；完整发布说明见 **`更新日志_v0.4.4.md`**
 
 ## 配置加载方式
 
@@ -140,3 +141,17 @@ config = get_config(
 ```
 
 data_server 模式下服务器推送任意周期 K 线 + 订单流数据，无需本地聚合。
+
+**HTTP 与备用（v0.4.4+）**：`ssquant/config/_server_config.py` 中顶层 `api_url` 与 `fallback_servers` 列表中的 `api_url` 共同构成鉴权与历史 K 线 REST 的端点顺序；仅配备用、不配顶层时，历史拉取与鉴权一致（见 **`更新日志_v0.4.4.md`**）。
+
+## 多数据源回测（`data_sources`）
+
+使用 `UnifiedStrategyRunner` 与 `data_sources` 列表时，每个元素可包含：
+
+| 键 | 说明 |
+|----|------|
+| `symbol` / `kline_period` / `adjust_type` | 与单数据源一致 |
+| `capital_ratio` | 可选，资金权重，多数据源间自动归一化 |
+| `initial_capital` | 可选，该数据源直接指定金额（与比例二选一逻辑以 `unified_runner` 为准） |
+
+示例见 `examples/B_多品种多周期交易策略.py`。

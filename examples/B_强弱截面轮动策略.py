@@ -397,30 +397,41 @@ if __name__ == "__main__":
             lookback_bars=500,                # K线回溯窗口 (0=不限制，策略get_klines返回的最大条数)
             
             # -------- 多品种 data_sources --------
+            # 每个品种可选设置资金分配（不填则所有品种平分 initial_capital）：
+            #   'capital_ratio': 6   — 按比例分配，如 A=6, B=4 则 A 占 60%, B 占 40%
+            #   'initial_capital': 60000  — 直接指定金额，如 A=60000, B=40000
             data_sources=[
                 {   # 数据源0: 螺纹钢
                     'symbol': 'rb888',        # 品种+888 = 主力连续
-                    'kline_period': '1m',     # K线周期
+                    'kline_period': '5m',     # K线周期
                     'adjust_type': '1',       # 复权: '0'不复权  '1'后复权  '2'前复权
                     'slippage_ticks': 1,      # 滑点跳数
+                    'capital_ratio': 4,     # 资金权重（不填则均分，如 A=6,B=4 即 A 占 60%）
+                    # 'initial_capital': 1,   # 或直接指定金额（如 60000）
                 },
                 {   # 数据源1: 热卷
                     'symbol': 'hc888',        # 品种+888 = 主力连续
-                    'kline_period': '3m',     # K线周期
+                    'kline_period': '5m',     # K线周期
                     'adjust_type': '1',       # 复权: '0'不复权  '1'后复权  '2'前复权
                     'slippage_ticks': 1,      # 滑点跳数
+                    'capital_ratio': 4,     # 资金权重（不填则均分，如 A=6,B=4 即 A 占 60%）
+                    # 'initial_capital': 1,   # 或直接指定金额（如 60000）
                 },
                 {   # 数据源2: 铁矿石
                     'symbol': 'i888',         # 品种+888 = 主力连续
-                    'kline_period': '1m',     # K线周期
+                    'kline_period': '5m',     # K线周期
                     'adjust_type': '1',       # 复权: '0'不复权  '1'后复权  '2'前复权
                     'slippage_ticks': 1,      # 滑点跳数
+                    'capital_ratio': 2,     # 资金权重（不填则均分，如 A=6,B=4 即 A 占 60%）
+                    # 'initial_capital': 1,   # 或直接指定金额（如 60000）
                 },
                 {   # 数据源3: 焦炭
                     'symbol': 'j888',         # 品种+888 = 主力连续
                     'kline_period': '5m',     # K线周期
                     'adjust_type': '1',       # 复权: '0'不复权  '1'后复权  '2'前复权
                     'slippage_ticks': 1,      # 滑点跳数
+                    'capital_ratio': 2,     # 资金权重（不填则均分，如 A=6,B=4 即 A 占 60%）
+                    # 'initial_capital': 1,   # 或直接指定金额（如 60000）
                 },
             ],
         )

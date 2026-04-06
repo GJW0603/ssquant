@@ -241,12 +241,15 @@ class MultiSourceBacktester:
         def sync_backtest_account():
             self._update_backtest_account(backtest_account_info, multi_data_source, self.symbol_configs)
 
-        for ds in multi_data_source.data_sources:
+        _per_ds_caps = self.base_config.get('_per_ds_capitals')
+        for _i, ds in enumerate(multi_data_source.data_sources):
             ds.configure_backtest_context(
                 symbol_config=self.symbol_configs.get(ds.symbol, {}),
                 account_info=backtest_account_info,
                 account_sync_callback=sync_backtest_account
             )
+            if _per_ds_caps and _i < len(_per_ds_caps):
+                ds._allocated_capital = _per_ds_caps[_i]
         
         # 创建策略上下文
         context = {

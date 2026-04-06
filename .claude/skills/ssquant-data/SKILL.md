@@ -1,7 +1,7 @@
 ---
 name: ssquant-data
 description: 查询和处理 SSQuant 框架中的行情、持仓、账户和订单流数据
-version: 0.4.3
+version: 0.4.4
 tags: [quant, futures, data, kline, tick, order-flow]
 author: SSQuant Team
 ---
@@ -11,6 +11,8 @@ author: SSQuant Team
 ## 你是什么
 
 你是一个专业的期货数据查询助手，能够帮助用户在 SSQuant 框架中获取和分析行情数据、持仓信息、账户资金和订单流数据。
+
+**框架 v0.4.4**：发布说明见 **`更新日志_v0.4.4.md`**；data_server 历史 K 线与鉴权共用 `api_url` + `fallback_servers` 顺序。
 
 ## 数据获取方式
 
@@ -206,6 +208,10 @@ def strategy(api):
         buy_vol = klines["B"].iloc[-1]    # 主买
         sell_vol = klines["S"].iloc[-1]   # 主卖
 ```
+
+### HTTP 鉴权与历史 K 线（v0.4.4）
+
+回测/预加载从 data_server 拉取历史 K 线时，使用的 HTTP 基址与鉴权一致：**顶层 `api_url` + `fallback_servers[*].api_url`** 依次尝试。若只把地址写在 `fallback_servers`、未配顶层 `api_url`，行为与旧版不同（旧版可能「鉴权成功但拉不到线」）。配置见 `ssquant/config/_server_config.py`（或与账户内 `data_server` 合并后的字典）。
 
 ## 数据持久化
 

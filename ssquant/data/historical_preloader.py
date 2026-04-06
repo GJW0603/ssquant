@@ -333,15 +333,12 @@ class HistoricalDataPreloader:
         """
         try:
             import requests
-            from ..config._server_config import DATA_SERVER
-            api_url = DATA_SERVER.get('api_url', '')
-            
-            if not api_url:
+            from .auth_manager import get_ordered_data_server_api_bases
+            api_bases = get_ordered_data_server_api_bases()
+            if not api_bases:
                 return pd.DataFrame()
-            
+
             normalized = period.strip().upper()
-            
-            url = f"{api_url.rstrip('/')}/api/futures/history"
             params = {
                 'symbol': symbol.lower(),
                 'period': normalized,
@@ -350,38 +347,52 @@ class HistoricalDataPreloader:
                 'preload': 'true',
             }
 
-            resp = requests.get(url, params=params, timeout=(20, 180))
-            if resp.status_code != 200:
-                return pd.DataFrame()
+            for api_base in api_bases:
+                url = f"{api_base}/api/futures/history"
+                try:
+                    resp = requests.get(url, params=params, timeout=(20, 180))
+                except requests.exceptions.ConnectionError:
+                    continue
+                except Exception:
+                    continue
 
-            result = resp.json()
-            if result.get('code') != 0:
-                return pd.DataFrame()
+                if resp.status_code != 200:
+                    continue
 
-            data_obj = result.get('data', {})
-            records = data_obj.get('klines', []) if isinstance(data_obj, dict) else data_obj
+                try:
+                    result = resp.json()
+                except Exception:
+                    continue
 
-            if not records:
-                return pd.DataFrame()
-            
-            df = pd.DataFrame(records)
-            
-            if df.empty or 'datetime' not in df.columns:
-                return pd.DataFrame()
-            
-            df['datetime'] = pd.to_datetime(df['datetime'])
-            df = df.set_index('datetime')
-            
-            print(f"[data_server API] 获取 {normalized} 数据: {symbol} x {len(df)} 条")
-            print(f"  数据范围: {df.index[0]} ~ {df.index[-1]}")
-            
-            # 本地复权（当前为占位直通，后续实现算法后自动生效）
-            if adjust_type != '0':
-                from .local_adjust import apply_local_adjust
-                df = apply_local_adjust(df, symbol, period, adjust_type)
-            
-            return df
-            
+                if result.get('code') != 0:
+                    continue
+
+                data_obj = result.get('data', {})
+                records = data_obj.get('klines', []) if isinstance(data_obj, dict) else data_obj
+
+                if not records:
+                    continue
+
+                df = pd.DataFrame(records)
+
+                if df.empty or 'datetime' not in df.columns:
+                    continue
+
+                df['datetime'] = pd.to_datetime(df['datetime'])
+                df = df.set_index('datetime')
+
+                print(f"[data_server API] 获取 {normalized} 数据: {symbol} x {len(df)} 条 (via {api_base})")
+                print(f"  数据范围: {df.index[0]} ~ {df.index[-1]}")
+
+                # 本地复权（当前为占位直通，后续实现算法后自动生效）
+                if adjust_type != '0':
+                    from .local_adjust import apply_local_adjust
+                    df = apply_local_adjust(df, symbol, period, adjust_type)
+
+                return df
+
+            return pd.DataFrame()
+
         except Exception:
             return pd.DataFrame()
     
